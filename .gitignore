@@ -1,0 +1,42 @@
+# ===== 密钥与环境配置（绝不提交）=====
+.env
+.env.*
+!.env.example
+docker-compose.yml
+docker-compose.override.yml
+*.secret
+
+# ===== 数据与数据库 =====
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+data/
+portal-data/
+imgcache/
+
+# ===== 备份与临时文件 =====
+*.bak
+*.bak-*
+*.old
+*.orig
+*.tmp
+_backup/
+_csp_test/
+_precheck/
+_shots/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# ===== 系统 / 编辑器 =====
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

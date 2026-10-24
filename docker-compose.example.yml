@@ -1,0 +1,80 @@
+# =====================================================================
+# 觅影（mivying）PanSou 网盘搜索 + portal 门脸 部署示例
+# 复制为 docker-compose.yml 后，把所有 <...> / change-me 占位改成真实值。
+# 真实的 docker-compose.yml 含密钥，已被 .gitignore 排除，请勿提交。
+# =====================================================================
+services:
+  pansou:
+    image: ghcr.io/fish2018/pansou-web:latest
+    container_name: pansou
+    restart: unless-stopped
+    ports:
+      - "8980:80"
+    environment:
+      # 上游 PanSou 访问 Telegram 频道的代理（如本机/旁路由 Clash 的 socks5）
+      - PROXY=socks5://<代理用户名>:<代理密码>@<旁路由IP>:7891
+      # 订阅的 Telegram 频道逗号分隔
+      - CHANNELS=tgsearchers7,Baidu_netdisk,bdwpzhpd,baidyunpan,rbzhwpzy,bdbdndn11,jdjdn1111,BaiduCloudDisk,Aliyun_4K_Movies,dianying4k,MCPH02,MCPH03,Q66Share,gimy115iso,PikPak_Share_Channel,guoman4K,Netdisk_Movies,PanjClub,baicaoZY,gotopan,ciliziyuanku
+      - ENABLED_PLUGINS=hunhepan,pansearch,qqpd,labi,zhizhen,shandian,duoduo,muou,xiaokupan,erxiaoaipan,aipan,pan365
+      - CACHE_ENABLED=true
+      - CACHE_TTL=60
+      - MAX_CONCURRENCY=40
+      - ASYNC_RESPONSE_TIMEOUT=3
+      # PanSou 自身认证关闭（认证由 portal 长效令牌负责）
+      - AUTH_ENABLED=false
+    volumes:
+      - ./data:/app/data
+    mem_limit: 512m
+    cpus: 1.0
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # 前置门脸：长效登录 + 服务端历史/收藏（跨设备）+ 失效链接过滤 + 用量统计/滥用告警
+  pansou-portal:
+    build: ./portal
+    image: pansou-portal:latest
+    container_name: pansou-portal
+    restart: unless-stopped
+    depends_on:
+      - pansou
+    ports:
+      - "8981:80"
+    environment:
+      - PANSOU_UPSTREAM=http://pansou
+      - DB_PATH=/app/data/portal.db
+      - ADMIN_USER=admin
+      # 账号清单（user:pass，逗号分隔；增删账号改这一行）。务必改成强密码。
+      - AUTH_USERS=admin:change-me-admin-password,user2:change-me-user-password
+      # portal 自签 JWT 密钥：用 `openssl rand -hex 32` 生成，至少 32 位，切勿提交
+      - JWT_SECRET=change-me-generate-with-openssl-rand-hex-32
+      # 长效令牌有效期（天）：180≈半年；想永久可改 3650
+      - TOKEN_TTL_DAYS=180
+      # 滥用告警：Bark 推送（iOS），填自己的设备 key；不需要可留空
+      - BARK_KEY=
+      # 海报图床回源代理（Telegram CDN 被墙时）；不需要可留空
+      - POSTER_PROXY=
+      # 频率阈值：近10分钟 >60 次 或 当日 >500 次 即告警（admin 账号豁免）
+      - RATE_WINDOW_SEC=600
+      - RATE_WINDOW_MAX=60
+      - RATE_DAY_MAX=500
+      # 同一 IP 告警冷却 15 分钟
+      - ALERT_COOLDOWN_SEC=900
+      # 事件明细保留 30 天
+      - EVENT_KEEP_DAYS=30
+      # 失效链接检测：搜索后自动检测画质排序前 N 条，确认失效的隐藏
+      - VERIFY_N=15
+      - VERIFY_WORKERS=12
+      - VERIFY_CACHE_TTL=1800
+      - VERIFY_TIMEOUT=3
+    volumes:
+      - ./portal-data:/app/data
+    mem_limit: 192m
+    cpus: 0.75
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
