@@ -802,7 +802,12 @@ function api(path,opt){
 }
 function esc(s){return (s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");}
 /* 外链守卫：只允许 http(s)，拦截 javascript:/data: 等危险 scheme，避免 XSS */
-function safeUrl(u){return /^https?:\/\//i.test(String(u||"").trim())?String(u).trim():"about:blank";}
+function safeUrl(u){
+  u=String(u||"").trim();
+  if(/^https?:\/\//i.test(u))return u;
+  if(/^magnet:\?/i.test(u))return u;   /* 磁力链接交由系统 BT 客户端唤起 */
+  return "about:blank";
+}
 
 /* 海报图多为 Telegram 图床(telesco.pe)，国内直连偶发超时：首次失败先露出首字占位，
    900ms 后带随机串重新请求一次；重试仍失败才永久隐藏，避免冷搜瞬间并发裂图。 */
@@ -1167,6 +1172,16 @@ function fmtDate(dt){
   function z(n){return n<10?"0"+n:n;}
   return d.getFullYear()+"-"+z(d.getMonth()+1)+"-"+z(d.getDate());
 }
+/* 去重键：网盘链接按去掉查询串的路径；磁力链接按 btih 哈希
+   （magnet:? 直接 split 会把所有磁力压成同一条）。 */
+function dedupKey(url){
+  url=url||"";
+  if(url.indexOf("magnet:")===0){
+    var m=/[?&]xt=urn:btih:([A-Za-z0-9]+)/i.exec(url);
+    return m?("magnet:"+m[1].toLowerCase()):url;
+  }
+  return url.split("?")[0];
+}
 function prettySource(s){return s.replace(/^tg:/,"TG · ").replace(/^plugin:/,"资源站 · ");}
 
 /* ================= 搜索 ================= */
@@ -1224,7 +1239,7 @@ function processData(merged){
     merged[t].forEach(function(raw){
       var it=normalize(raw,t);
       if(!it.url)return;
-      var key=it.url.split("?")[0];
+      var key=dedupKey(it.url);
       if(!seen[key]||it.score>seen[key].score){seen[key]=it;}
     });
     rows=Object.keys(seen).map(function(k){return seen[k];});
@@ -1235,7 +1250,10 @@ function processData(merged){
   var el=Date.now()-state.startTime;
   document.getElementById("rTime").textContent="用时 "+el+" ms";
   var vf=document.getElementById("rVerify");
-  if(state.verified&&state.verified.checked){
+  if(state.verified&&state.verified.source==="local"){
+    vf.textContent="本地缓存 · 秒开，后台已自动更新";
+    vf.style.display="";
+  }else if(state.verified&&state.verified.checked){
     vf.textContent="已验证前 "+state.verified.checked+" 条，"+state.verified.removed+" 条失效已隐藏";
     vf.style.display="";
   }else{vf.textContent="";vf.style.display="none";}
@@ -1784,7 +1802,7 @@ function renderUserManage(){
     if(!items.length)h+='<div style="'+HINT_STYLE+'">暂无账号</div>';
     items.forEach(function(u){
       var isMe=state.me&&state.me.username===u.username;
-      var isBoot=u.protected===true;
+      var isBoot=!!u.boot;
       var locked=isMe||isBoot;
       h+='<div class="um-row'+(u.enabled?'':' disabled')+'" data-uid="'+u.id+'">'+
         '<div class="um-u">'+esc(u.username)+

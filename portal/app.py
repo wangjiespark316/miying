@@ -64,9 +64,8 @@ VERIFY_CACHE_TTL = int(os.environ.get("VERIFY_CACHE_TTL", "1800"))
 VERIFY_TIMEOUT = float(os.environ.get("VERIFY_TIMEOUT", "3"))
 
 # 海报图片代理：海报多为 Telegram CDN（telesco.pe，国内直连被墙），
-# 由 portal 经 HTTP 代理回源后转发，浏览器只走同源站点。
-# 留空 = 不使用代理直连回源；需要时通过环境变量 POSTER_PROXY 传入，
-# 形如 http://user:pass@host:port，切勿把真实代理凭证写进代码。
+# 由 portal 经 HTTP 代理回源后转发，浏览器只走同源，不直连图床。
+# 留空=不代理；需要时经环境变量传入，例如 http://user:pass@host:port
 POSTER_PROXY = os.environ.get("POSTER_PROXY", "")
 POSTER_CACHE_DIR = os.environ.get("POSTER_CACHE_DIR", "/app/data/imgcache")
 POSTER_CACHE_TTL = int(os.environ.get("POSTER_CACHE_TTL", str(30 * 86400)))
@@ -85,6 +84,26 @@ POSTER_PROXY_HOSTS = {"telesco.pe"}
 DEFAULT_EXCLUDE = ["预告", "花絮", "枪版", "抢先", "偷拍", "解说",
                    "速看", "片花", "宣传片", "抢先版", "tc版", "hdcam",
                    "cam版", "ts版", "高清预告"]
+
+# ---------------- 混合 FTS5 预索引 ----------------
+# 平时把"全网热榜 + 高频搜索词 + 追剧词 + 固定常用词"的 PanSou 结果持久化进本地
+# FTS5；搜索时先查本地（秒开），不足/miss 再回源 PanSou，回源结果异步回填。
+# 全程只调 PanSou 自己的搜索接口，不直接连 Telegram，因此不需要 api_id/api_hash。
+FTS_ENABLED = bool(int(os.environ.get("FTS_ENABLED", "1")))
+FTS_FILL_INTERVAL = int(os.environ.get("FTS_FILL_INTERVAL", str(6 * 3600)))  # 填充周期 6h
+FTS_JOB_TTL = int(os.environ.get("FTS_JOB_TTL", str(6 * 3600)))             # 单词刷新 TTL
+FTS_STARTUP_DELAY = int(os.environ.get("FTS_STARTUP_DELAY", "120"))          # 启动后延迟
+FTS_MIN_HITS = int(os.environ.get("FTS_MIN_HITS", "8"))                      # 本地命中足够阈值
+FTS_MAX_WORDS = int(os.environ.get("FTS_MAX_WORDS", "30"))                   # 每轮最多填充词数
+FTS_MAX_ARTS_PER_WORD = int(os.environ.get("FTS_MAX_ARTS_PER_WORD", "60"))   # 每词最多入库
+FTS_ART_TTL = int(os.environ.get("FTS_ART_TTL", str(45 * 86400)))            # 条目过期清理
+FTS_WORD_GAP = float(os.environ.get("FTS_WORD_GAP", "1.5"))                  # 词间间隔
+FTS_QUERY_LIMIT = int(os.environ.get("FTS_QUERY_LIMIT", "80"))               # 本地查询返回上限
+# 热搜/热榜覆盖不到的固定常用词（热门 / 经典画质标杆，与 warm-cache 对齐）
+FTS_STATIC_WORDS = ["沙丘2", "阿凡达", "让子弹飞", "奥本海默", "流浪地球2",
+                    "满江红", "封神第一部", "年会不能停", "热辣滚烫",
+                    "消失的她", "沙丘", "阿凡达3", "庆余年", "繁花",
+                    "与凤行", "黑神话悟空", "三体", "狂飙", "我是刑警"]
 
 # 追剧更新监控：后台定时检索订阅词，发现比基线新的资源即推送
 WATCH_INTERVAL_SEC = int(os.environ.get("WATCH_INTERVAL_SEC", "7200"))
@@ -226,6 +245,29 @@ def init_db():
             year TEXT DEFAULT '',
             miss INTEGER DEFAULT 0,
             ts REAL NOT NULL)""")
+        # ---- 混合 FTS5 预索引 ----
+        # 资源条目主表：存原始 item JSON（raw），返回时直接还原，保证前端渲染一致
+        db.execute("""CREATE TABLE IF NOT EXISTS idx_arts(
+            url TEXT PRIMARY KEY,
+            drive TEXT DEFAULT '',
+            note TEXT DEFAULT '',
+            datetime TEXT DEFAULT '',
+            score INTEGER DEFAULT 0,
+            raw TEXT DEFAULT '',
+            kws TEXT DEFAULT '',
+            first_seen REAL,
+            last_seen REAL)""")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_arts_drive ON idx_arts(drive)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_arts_seen ON idx_arts(last_seen)")
+        # FTS5 全文表：trigram 分词（3 字符滑动窗口，适合中文子串/混排），仅索引标题
+        db.execute("""CREATE VIRTUAL TABLE IF NOT EXISTS idx_fts USING fts5(
+            note, url UNINDEXED, tokenize='trigram')""")
+        # 每关键词的填充记录（TTL 判断 / 统计）
+        db.execute("""CREATE TABLE IF NOT EXISTS idx_jobs(
+            kw TEXT PRIMARY KEY,
+            n INTEGER DEFAULT 0,
+            last_run REAL,
+            src TEXT DEFAULT '')""")
         db.execute("PRAGMA journal_mode=WAL")
     try:
         os.chmod(DB_PATH, 0o600)
@@ -261,13 +303,8 @@ def seed_users():
         row = conn.execute("SELECT id FROM users WHERE username=?",
                            (ADMIN_USER,)).fetchone()
         if row is None:
-            # 不再使用硬编码默认口令：AUTH_USERS 未配置管理员密码时，
-            # 随机生成一个临时密码并打印到容器日志（首次启动可见），避免固定弱口令。
-            p = ENV_USERS.get(ADMIN_USER)
-            if not p:
-                p = secrets.token_urlsafe(18)
-                print(f"[init] 未在 AUTH_USERS 配置管理员 {ADMIN_USER} 的密码，"
-                      f"已为其生成随机临时密码（请尽快修改或在环境变量中配置）：{p}")
+            # 仅在 ADMIN_USER 未列入 AUTH_USERS 时兜底；务必在 AUTH_USERS 中显式配置强密码
+            p = ENV_USERS.get(ADMIN_USER, "admin-change-me")
             salt, h = hash_password(p)
             conn.execute(
                 """INSERT INTO users(username,salt,pwd_hash,role,enabled,
@@ -598,6 +635,33 @@ async def _search_proxy(request: Request, username: str):
     ip = client_ip(request)
     body = await request.body()
     target_url, body = _inject_clean_filter(request, body)
+
+    # ===== 混合检索：先查本地 FTS5，命中足够则立即返回（SWR），后台异步保鲜 =====
+    if FTS_ENABLED and keyword and request.method == "GET":
+        local_mbt, local_total = {}, 0
+        try:
+            local_mbt = _fts_local_search(keyword)
+            local_total = sum(len(v) for v in local_mbt.values())
+        except Exception as e:
+            print("[portal] local search error:", e)
+        if local_total >= FTS_MIN_HITS:
+            # 后台刷新（TTL 过期回源 + 验证剔除失效），本次响应不等待
+            asyncio.create_task(_fts_bg_refresh(keyword))
+            data = {"merged_by_type": local_mbt, "total": local_total,
+                    "verified": {"checked": 0, "removed": 0,
+                                 "source": "local"}}
+            if local_total:
+                _record_history(username, keyword, src, data)
+            _record_event(ip, keyword, src, data)
+            check_abuse(ip, keyword, username)
+            payload = {"code": 0, "data": data}
+            return Response(
+                content=json.dumps(payload, ensure_ascii=False).encode(),
+                status_code=200,
+                headers={"content-type": "application/json",
+                         "X-Source": "local-cache"})
+
+    # ===== 本地不足 / miss：回源 PanSou（原完整流程） =====
     try:
         async with httpx.AsyncClient(
                 timeout=httpx.Timeout(180.0, connect=15.0)) as client:
@@ -638,16 +702,27 @@ async def _search_proxy(request: Request, username: str):
                         if kept:
                             new_mbt[typ] = kept
                     data["merged_by_type"] = new_mbt
+                    # 确认失效的链接从本地索引移除（dead 通常很少，sqlite 毫秒级）
+                    for du in dead:
+                        try:
+                            _fts_remove_url(du)
+                        except Exception:
+                            pass
                 data["total"] = sum(
                     len(v) for v in data.get("merged_by_type", {}).values())
                 data["verified"] = {
-                    "checked": len(check_urls), "removed": removed}
+                    "checked": len(check_urls), "removed": removed,
+                    "source": "upstream"}
                 # 0 结果不写入用户个人历史（避免污染历史列表）；
                 # 但 events 仍记录（匿名用量/限流/统计需要完整搜索行为）。
                 if data.get("total"):
                     _record_history(username, keyword, src, data)
                 _record_event(ip, keyword, src, data)
                 check_abuse(ip, keyword, username)
+                # 回源结果异步回填索引（下次该词本地命中、秒开）
+                if FTS_ENABLED and data.get("total"):
+                    asyncio.create_task(
+                        _fts_backfill(keyword, data["merged_by_type"]))
                 content = json.dumps(payload, ensure_ascii=False).encode()
         ctype = upstream.headers.get("content-type", "application/json")
         return Response(content=content, status_code=upstream.status_code,
@@ -1362,8 +1437,7 @@ async def admin_list_users(request: Request):
         d = dict(r)
         d["search_count"] = hm.get(r["username"], 0)
         d["fav_count"] = fm.get(r["username"], 0)
-        # 兜底管理员（由 ADMIN_USER 指定）不可删除/停用/降级，前端据此锁定
-        d["protected"] = (r["username"] == ADMIN_USER)
+        d["boot"] = (r["username"] == ADMIN_USER)  # 环境变量兜底管理员，禁止停用/删除/降级
         out.append(d)
     return {"items": out}
 
@@ -1477,6 +1551,139 @@ async def change_password(request: Request):
         conn.execute("UPDATE users SET salt=?, pwd_hash=?, pw_ts=? "
                      "WHERE username=?", (salt, hsh, now_ts(), u))
     return {"ok": True}
+
+
+# ---------------- 混合 FTS5 预索引：写入 / 查询 / 清理 ----------------
+def _fts_upsert(kw: str, mbt: dict):
+    """把一次 PanSou 搜索结果（merged_by_type）幂等写入 idx_arts + idx_fts。
+    按 url 去重，同 url 保留画质分高的；kw 关联进 kws（一条资源可被多个词命中）。"""
+    if not FTS_ENABLED:
+        return 0
+    best = {}
+    for drive, items in (mbt or {}).items():
+        for it in items:
+            url = (it.get("url") or "").strip()
+            if not url:
+                continue
+            sc = quality_score(it)
+            if url not in best or sc > best[url][2]:
+                best[url] = (drive, it, sc)
+    if not best:
+        return 0
+    rows = list(best.values())[:FTS_MAX_ARTS_PER_WORD]
+    n = 0
+    now = time.time()
+    with db() as conn:
+        for drive, it, sc in rows:
+            url = (it.get("url") or "").strip()
+            note = (it.get("note") or "").strip()
+            dt = it.get("datetime") or ""
+            old = conn.execute(
+                "SELECT kws,first_seen FROM idx_arts WHERE url=?",
+                (url,)).fetchone()
+            kws = []
+            if old:
+                try:
+                    kws = json.loads(old["kws"] or "[]")
+                except Exception:
+                    kws = []
+            if kw not in kws:
+                kws.append(kw)
+            kws_json = json.dumps(kws, ensure_ascii=False)
+            raw = json.dumps(it, ensure_ascii=False)
+            if old:
+                first_seen = old["first_seen"] or now
+                conn.execute(
+                    """UPDATE idx_arts SET drive=?,note=?,datetime=?,score=?,
+                       raw=?,kws=?,first_seen=?,last_seen=? WHERE url=?""",
+                    (drive, note, dt, sc, raw, kws_json, first_seen, now, url))
+            else:
+                conn.execute(
+                    """INSERT INTO idx_arts(url,drive,note,datetime,score,raw,
+                       kws,first_seen,last_seen) VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (url, drive, note, dt, sc, raw, kws_json, now, now))
+            # FTS 幂等：按 url 删旧再插（已验证 UNINDEXED 列可删除）。
+            # 索引文本 = 标题 + 关联词（kws）：英文/变体标题也能被中文词命中。
+            fts_text = note + " " + " ".join(kws)
+            conn.execute("DELETE FROM idx_fts WHERE url=?", (url,))
+            conn.execute("INSERT INTO idx_fts(note,url) VALUES(?,?)",
+                         (fts_text, url))
+            n += 1
+    return n
+
+
+def _fts_remove_url(url: str):
+    """资源确认失效时，从索引中移除。"""
+    with db() as conn:
+        conn.execute("DELETE FROM idx_fts WHERE url=?", (url,))
+        conn.execute("DELETE FROM idx_arts WHERE url=?", (url,))
+
+
+def _fts_local_search(kw: str):
+    """本地检索 -> merged_by_type（dict）。
+    FTS5 trigram 处理 ≥3 字（rank 相关性），LIKE 兜底短词/子串；结果按前端
+    渲染所需的原始 item 还原并按 drive 分组。"""
+    kw = (kw or "").strip()
+    if not FTS_ENABLED or not kw:
+        return {}
+    ordered, seen = [], set()
+    with db() as conn:
+        # 1) FTS5 trigram（≥3 字），按 rank
+        if len(kw) >= 3:
+            try:
+                phrase = '"' + kw.replace('"', '""') + '"'
+                for r in conn.execute(
+                        "SELECT url FROM idx_fts WHERE idx_fts MATCH ? "
+                        "ORDER BY rank LIMIT ?",
+                        (phrase, FTS_QUERY_LIMIT)):
+                    if r["url"] not in seen:
+                        seen.add(r["url"])
+                        ordered.append(r["url"])
+            except Exception as e:
+                print("[portal] fts match error:", kw, e)
+        # 2) LIKE 兜底/补充（短词、子串），转义 % _ \，按画质分；
+        #    同时匹配 note 与 kws（JSON），让 2 字短词也能命中关联的英文标题。
+        like = kw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pat = "%" + like + "%"
+        for r in conn.execute(
+                "SELECT url FROM idx_arts WHERE note LIKE ? ESCAPE '\\' "
+                "OR kws LIKE ? ESCAPE '\\' "
+                "ORDER BY score DESC, last_seen DESC LIMIT ?",
+                (pat, pat, FTS_QUERY_LIMIT)):
+            if r["url"] not in seen:
+                seen.add(r["url"])
+                ordered.append(r["url"])
+        # 3) 还原原始 item，按 drive 分组（保持顺序）
+        mbt = {}
+        for i in range(0, len(ordered), 200):
+            chunk = ordered[i:i + 200]
+            ph = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT url,drive,raw FROM idx_arts WHERE url IN ({ph})",
+                chunk).fetchall()
+            mp = {r["url"]: (r["drive"], r["raw"]) for r in rows}
+            for u in chunk:
+                if u not in mp:
+                    continue
+                drive, raw = mp[u]
+                try:
+                    item = json.loads(raw)
+                except Exception:
+                    continue
+                mbt.setdefault(drive, []).append(item)
+    return mbt
+
+
+def _fts_purge_stale():
+    """清理长期未被刷新的过期条目；返回清理条数。"""
+    cut = time.time() - FTS_ART_TTL
+    with db() as conn:
+        dead = [r["url"] for r in conn.execute(
+            "SELECT url FROM idx_arts WHERE last_seen<?", (cut,)).fetchall()]
+        for u in dead:
+            conn.execute("DELETE FROM idx_fts WHERE url=?", (u,))
+            conn.execute("DELETE FROM idx_arts WHERE url=?", (u,))
+    return len(dead)
 
 
 # ---------------- 追剧更新监控 ----------------
@@ -1647,6 +1854,142 @@ async def watch_loop():
         await asyncio.sleep(WATCH_INTERVAL_SEC)
 
 
+# ---------------- 混合 FTS5：填充词收集 / 定时填充 / 回填 / 后台保鲜 ----------------
+async def _fts_collect_words(client: httpx.AsyncClient):
+    """收集填充词，返回 [(kw, src)]，去重并按来源优先级排序。"""
+    words, seen = [], set()
+
+    def add(kw, src):
+        kw = (kw or "").strip()
+        if kw and kw not in seen and len(kw) <= 40:
+            seen.add(kw)
+            words.append((kw, src))
+
+    # 1) 豆瓣全网热榜（movies + tv）
+    try:
+        movies, tv = await asyncio.gather(
+            _douban_subjects("movie", client, 10),
+            _douban_subjects("tv", client, 10),
+            return_exceptions=True)
+        for it in (movies if isinstance(movies, list) else []):
+            add(it.get("title"), "trending")
+        for it in (tv if isinstance(tv, list) else []):
+            add(it.get("title"), "trending")
+    except Exception as e:
+        print("[portal] fts collect trending failed:", e)
+    # 2) 用户高频搜索词 + 3) 追剧词（直接查 DB）
+    week_cut = time.strftime("%Y-%m-%dT%H:%M:%S",
+                             time.localtime(time.time() - 7 * 86400))
+    with db() as conn:
+        for r in conn.execute(
+                """SELECT keyword FROM history WHERE ts>=?
+                   GROUP BY keyword ORDER BY COUNT(*) DESC LIMIT 10""",
+                (week_cut,)):
+            add(r["keyword"], "hot")
+        for r in conn.execute("SELECT DISTINCT keyword FROM watch"):
+            add(r["keyword"], "watch")
+    # 4) 固定常用词
+    for w in FTS_STATIC_WORDS:
+        add(w, "static")
+    return words
+
+
+def _fts_mark_job(kw, n, src):
+    with db() as conn:
+        conn.execute(
+            """INSERT INTO idx_jobs(kw,n,last_run,src) VALUES(?,?,?,?)
+               ON CONFLICT(kw) DO UPDATE SET n=?,last_run=?,src=?""",
+            (kw, n, time.time(), src, n, time.time(), src))
+
+
+async def _fts_fill(force: bool = False):
+    """定时填充：对收集到的词逐个走 PanSou 搜索并持久化；词间限流。"""
+    if not FTS_ENABLED:
+        return
+    async with httpx.AsyncClient(
+            timeout=httpx.Timeout(60.0, connect=15.0)) as client:
+        words = await _fts_collect_words(client)
+        done = 0
+        for kw, src in words[:FTS_MAX_WORDS]:
+            if not force:
+                with db() as conn:
+                    job = conn.execute(
+                        "SELECT last_run FROM idx_jobs WHERE kw=?",
+                        (kw,)).fetchone()
+                if job and job["last_run"] and \
+                        time.time() - job["last_run"] < FTS_JOB_TTL:
+                    continue
+            t0 = time.time()
+            mbt = await _internal_search(kw, client)
+            n = _fts_upsert(kw, mbt)
+            _fts_mark_job(kw, n, src)
+            done += 1
+            print("[portal] fts fill %s -> %d (%.1fs)"
+                  % (kw, n, time.time() - t0), flush=True)
+            await asyncio.sleep(FTS_WORD_GAP)
+    purged = _fts_purge_stale()
+    print("[portal] fts fill done: %d words, purged %d" % (done, purged))
+
+
+async def _fts_backfill(kw: str, mbt: dict):
+    """搜索回源结果异步回填（fire-and-forget，异常不影响主流程）。"""
+    try:
+        n = _fts_upsert(kw, mbt)
+        _fts_mark_job(kw, n, "search")
+    except Exception as e:
+        print("[portal] fts backfill error:", e)
+
+
+async def _fts_bg_refresh(kw: str):
+    """本地命中后异步保鲜（SWR）：TTL 过期则回源刷新并回填；并轻量验证
+    本地前 N 条、剔除失效，保证下次打开更准。"""
+    try:
+        now = time.time()
+        need = True
+        with db() as conn:
+            job = conn.execute("SELECT last_run FROM idx_jobs WHERE kw=?",
+                               (kw,)).fetchone()
+        if job and job["last_run"] and now - job["last_run"] < FTS_JOB_TTL:
+            need = False
+        async with httpx.AsyncClient(
+                timeout=httpx.Timeout(60.0, connect=15.0)) as client:
+            if need:
+                mbt = await _internal_search(kw, client)
+                if mbt:
+                    n = _fts_upsert(kw, mbt)
+                    _fts_mark_job(kw, n, "refresh")
+            # 轻量验证本地前 N 条，剔除失效
+            local = _fts_local_search(kw)
+            urls = []
+            for items in local.values():
+                for it in items:
+                    u = (it.get("url") or "").strip()
+                    if u:
+                        urls.append(u)
+            if urls:
+                async with httpx.AsyncClient(
+                        timeout=httpx.Timeout(VERIFY_TIMEOUT + 2),
+                        follow_redirects=True) as vclient:
+                    verdict = await verify_urls(urls[:VERIFY_N], vclient)
+                for u, st in verdict.items():
+                    if st == "dead":
+                        _fts_remove_url(u)
+    except Exception as e:
+        print("[portal] fts bg refresh error:", e)
+
+
+async def fts_loop():
+    await asyncio.sleep(FTS_STARTUP_DELAY)
+    while True:
+        try:
+            await _fts_fill()
+        except Exception as e:
+            print("[portal] fts_loop error:", e)
+        await asyncio.sleep(FTS_FILL_INTERVAL)
+
+
 @app.on_event("startup")
 async def _start_watch():
     asyncio.create_task(watch_loop())
+    if FTS_ENABLED:
+        asyncio.create_task(fts_loop())

@@ -69,6 +69,13 @@ services:
       - VERIFY_WORKERS=12
       - VERIFY_CACHE_TTL=1800
       - VERIFY_TIMEOUT=3
+      # 混合 FTS5 预索引：搜索先查本地（约百毫秒），未命中再回源，后台异步回填
+      - FTS_ENABLED=1
+      - FTS_FILL_INTERVAL=21600
+      - FTS_MIN_HITS=8
+      - FTS_MAX_WORDS=30
+      - FTS_MAX_ARTS_PER_WORD=60
+      - FTS_QUERY_LIMIT=80
     volumes:
       - ./portal-data:/app/data
     mem_limit: 192m
