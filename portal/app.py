@@ -332,6 +332,17 @@ async def auth_handler(request: Request, exc: _AuthError):
     return JSONResponse(exc.body, status_code=exc.status)
 
 
+async def _json_body(request: Request) -> dict:
+    """安全解析 JSON body；空 body、非法 JSON、顶层非对象统一返回 400，而非抛 500。"""
+    try:
+        data = await request.json()
+    except Exception:
+        raise _AuthError(400, {"detail": "请求体不是合法的 JSON"})
+    if not isinstance(data, dict):
+        raise _AuthError(400, {"detail": "请求体格式错误"})
+    return data
+
+
 def current_user(request: Request):
     auth = request.headers.get("authorization", "")
     if not auth.startswith("Bearer "):
@@ -1161,7 +1172,7 @@ def _login_failed(ip: str):
 async def login(request: Request):
     ip = client_ip(request)
     _login_gate(ip)  # 先过防爆破闸门
-    payload = await request.json()
+    payload = await _json_body(request)
     u = (payload.get("username") or "").strip()
     p = payload.get("password") or ""
     with db() as conn:
@@ -1237,7 +1248,7 @@ async def list_favorites(request: Request):
 @app.post("/portal/api/favorites")
 async def add_favorite(request: Request):
     u = require_user(request)
-    payload = await request.json()
+    payload = await _json_body(request)
     url = (payload.get("url") or "").strip()
     if not url:
         raise _AuthError(400, {"detail": "缺少 url"})
@@ -1360,7 +1371,7 @@ async def admin_list_users(request: Request):
 @app.post("/portal/api/admin/users")
 async def admin_create_user(request: Request):
     require_admin(request)
-    p = await request.json()
+    p = await _json_body(request)
     username = (p.get("username") or "").strip()
     password = p.get("password") or ""
     role = "admin" if p.get("role") == "admin" else "user"
@@ -1383,7 +1394,7 @@ async def admin_create_user(request: Request):
 @app.post("/portal/api/admin/users/{uid}")
 async def admin_update_user(uid: int, request: Request):
     require_admin(request)
-    p = await request.json()
+    p = await _json_body(request)
     with db() as conn:
         row = conn.execute("SELECT * FROM users WHERE id=?",
                            (uid,)).fetchone()
@@ -1408,7 +1419,7 @@ async def admin_update_user(uid: int, request: Request):
 @app.post("/portal/api/admin/users/{uid}/password")
 async def admin_reset_password(uid: int, request: Request):
     require_admin(request)
-    p = await request.json()
+    p = await _json_body(request)
     password = p.get("password") or ""
     if len(password) < PASSWORD_MIN:
         raise _AuthError(400, {"detail": f"密码至少 {PASSWORD_MIN} 位"})
@@ -1438,6 +1449,11 @@ async def admin_delete_user(uid: int, request: Request):
         if row["role"] == "admin" and row["enabled"] == 1 \
                 and _admin_count(conn) <= 1:
             raise _AuthError(400, {"detail": "至少保留一个启用的管理员"})
+        # 级联清理该用户私有数据，避免同名重建账号继承历史/收藏/追剧
+        uname = row["username"]
+        conn.execute("DELETE FROM favorites WHERE username=?", (uname,))
+        conn.execute("DELETE FROM watch WHERE username=?", (uname,))
+        conn.execute("DELETE FROM history WHERE username=?", (uname,))
         conn.execute("DELETE FROM users WHERE id=?", (uid,))
     return {"ok": True}
 
@@ -1446,7 +1462,7 @@ async def admin_delete_user(uid: int, request: Request):
 @app.post("/portal/api/change-password")
 async def change_password(request: Request):
     u = require_user(request)
-    p = await request.json()
+    p = await _json_body(request)
     old_p = p.get("old_password") or ""
     new_p = p.get("new_password") or ""
     if len(new_p) < PASSWORD_MIN:
@@ -1542,7 +1558,7 @@ async def list_watch(request: Request):
 @app.post("/portal/api/watch")
 async def add_watch(request: Request):
     u = require_user(request)
-    p = await request.json()
+    p = await _json_body(request)
     kw = (p.get("keyword") or "").strip()
     if not kw:
         raise _AuthError(400, {"detail": "请填写要追的剧名"})
