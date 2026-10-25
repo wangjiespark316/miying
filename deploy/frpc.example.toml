@@ -1,0 +1,26 @@
+# =====================================================================
+# frpc 客户端配置示例（内网穿透）
+# 家里没有公网 IP 时，用 frpc 把家里的 portal 映射到公网服务器，
+# 再由公网服务器上的 nginx 做 TLS 反代。
+# 文档：https://gofrp.org/zh-cn/docs/
+# 部署：frpc -c frpc.toml
+# =====================================================================
+
+serverAddr = "your-public-server-ip"   # 公网服务器 IP（如阿里云 EIP）
+serverPort = 7000
+auth.token = "change-me-frp-token"     # 必须与 frps 一致：openssl rand -hex 32
+
+# 把家里的 portal（8981）映射到公网服务器的 127.0.0.1:8980
+# （frps 建议设 proxyBindAddr="127.0.0.1"，只让本机 nginx 访问，不直接暴露）
+[[proxies]]
+name = "miying"
+type = "tcp"
+localIP = "127.0.0.1"        # 若 frpc 跑在别的机器，填 N100 宿主机内网 IP
+localPort = 8981
+remotePort = 8980
+
+# 公网服务器 frps 最小配置（frps.toml）：
+#   bindPort = 7000
+#   auth.token = "change-me-frp-token"
+#   proxyBindAddr = "127.0.0.1"
+# 然后 nginx 把 /api/、/portal/ 反代到 http://127.0.0.1:8980（见 deploy/nginx.conf）
