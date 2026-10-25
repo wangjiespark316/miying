@@ -23,11 +23,32 @@
 
 ## 界面预览
 
-| 桌面 · 首页 | 桌面 · 搜索结果 |
-| :---: | :---: |
-| ![首页](assets/shot-home.png) | ![搜索结果](assets/shot-search.png) |
-| **手机端（响应式）** | 海报网格 · 画质标签 · 网盘分类 |
-| ![手机](assets/shot-mobile.png) | ![结果](assets/shot-search.png) |
+**桌面 · 首页与搜索结果**
+
+<p align="center">
+  <img src="assets/shot-home.png" width="48%" alt="桌面首页" />
+  <img src="assets/shot-search.png" width="48%" alt="搜索结果" />
+</p>
+
+**资源详情 · 列表视图**
+
+<p align="center">
+  <img src="assets/shot-detail.png" width="48%" alt="资源详情弹窗" />
+  <img src="assets/shot-list.png" width="48%" alt="列表视图" />
+</p>
+
+**我的收藏 · 追剧更新**
+
+<p align="center">
+  <img src="assets/shot-fav.png" width="48%" alt="我的收藏" />
+  <img src="assets/shot-watch.png" width="48%" alt="追剧更新" />
+</p>
+
+**手机端（响应式）**
+
+<p align="center">
+  <img src="assets/shot-mobile.png" width="26%" alt="手机端" />
+</p>
 
 ## 功能特性
 
