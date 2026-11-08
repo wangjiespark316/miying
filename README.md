@@ -50,6 +50,31 @@
   <img src="assets/shot-mobile.png" width="26%" alt="手机端" />
 </p>
 
+## 快速开始
+
+**需要**：一台常开主机（Docker / Docker Compose v2）、（可选）用于回源 Telegram 图床的代理。
+
+### 一键部署（推荐）
+
+```bash
+git clone https://github.com/wangjiespark316/miying.git
+cd miying
+bash scripts/install.sh        # 交互式设置管理员，自动生成 JWT、构建启动
+```
+
+### 手动部署
+
+```bash
+cp docker-compose.example.yml docker-compose.yml
+# 编辑 docker-compose.yml：填入 AUTH_USERS、JWT_SECRET（openssl rand -hex 32）、
+# BARK_KEY、POSTER_PROXY、上游频道 / 插件、代理等
+docker compose up -d --build
+curl http://localhost:8981/portal/health    # {"ok":true,...}
+```
+
+- portal 监听 `8981`（容器内 80），上游 pansou 监听 `8980`。
+- 前端 `web/index.html` 用任意静态服务器托管，把 `/api`、`/portal` 反代到 portal（见 `deploy/nginx.conf`）。
+
 ## 功能特性
 
 - **聚合搜索**：百度 / 夸克 / 阿里 / UC / 天翼 / 115 / 迅雷 / 123 / 光鸭 / PikPak / 磁力等多来源，按画质分排序、按 URL 去重；磁力按 btih 哈希去重。
@@ -89,31 +114,6 @@ flowchart LR
     PO --> DB
     PO -->|"Bark 推送"| PHONE["手机通知"]
 ```
-
-## 快速开始
-
-**需要**：一台常开主机（Docker / Docker Compose v2）、（可选）用于回源 Telegram 图床的代理。
-
-### 一键部署（推荐）
-
-```bash
-git clone https://github.com/wangjiespark316/miying.git
-cd miying
-bash scripts/install.sh        # 交互式设置管理员，自动生成 JWT、构建启动
-```
-
-### 手动部署
-
-```bash
-cp docker-compose.example.yml docker-compose.yml
-# 编辑 docker-compose.yml：填入 AUTH_USERS、JWT_SECRET（openssl rand -hex 32）、
-# BARK_KEY、POSTER_PROXY、上游频道 / 插件、代理等
-docker compose up -d --build
-curl http://localhost:8981/portal/health    # {"ok":true,...}
-```
-
-- portal 监听 `8981`（容器内 80），上游 pansou 监听 `8980`。
-- 前端 `web/index.html` 用任意静态服务器托管，把 `/api`、`/portal` 反代到 portal（见 `deploy/nginx.conf`）。
 
 ## 公网访问
 
