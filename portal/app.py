@@ -46,7 +46,7 @@ logger = logging.getLogger("portal")
 UPSTREAM = os.environ.get("PANSOU_UPSTREAM", "http://pansou").rstrip("/")
 DB_PATH = os.environ.get("DB_PATH", "/app/data/portal.db")
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
-APP_VERSION = os.environ.get("APP_VERSION", "0.5.0")
+APP_VERSION = os.environ.get("APP_VERSION", "0.5.1")
 
 # SQLite 在线备份：启动一份 + 每日轮转，Connection.backup() 在 WAL 下也保证一致性
 BACKUP_ENABLED = bool(int(os.environ.get("BACKUP_ENABLED", "1")))
@@ -633,8 +633,15 @@ def init_db():
             cover TEXT DEFAULT '',
             title TEXT DEFAULT '',
             year TEXT DEFAULT '',
+            rating TEXT DEFAULT '',
             miss INTEGER DEFAULT 0,
             ts REAL NOT NULL)""")
+        # 老库补 rating 列（第六批前缓存表不存评分，导致 meta 行评分恒空）
+        fb_cols = {r[1] for r in db.execute("PRAGMA table_info(poster_fallback)")}
+        if fb_cols and "rating" not in fb_cols:
+            db.execute("ALTER TABLE poster_fallback ADD COLUMN rating TEXT DEFAULT ''")
+            # 旧命中缓存缺评分：置过期，下次请求重拉并回写评分（封面可重建）
+            db.execute("UPDATE poster_fallback SET ts=0 WHERE cover IS NOT NULL AND cover<>''")
         # ---- 混合 FTS5 预索引 ----
         # 资源条目主表：存原始 item JSON（raw），返回时直接还原，保证前端渲染一致
         db.execute("""CREATE TABLE IF NOT EXISTS idx_arts(
@@ -1144,22 +1151,6 @@ def _pending(urls: list) -> list:
             if not (u in _verify_cache and now - _verify_cache[u][1] < VERIFY_CACHE_TTL)]
 
 
-def _rewrite_history_counts(keyword: str, mbt: dict):
-    """后台验证定性后，按最新持久化死链集合重算该词存活条数，回写各用户该关键词
-    最近一条历史（total/各网盘 counts），让历史计数与前台最终所见结果同源。"""
-    try:
-        alive_mbt, _ = _filter_dead_mbt(mbt)
-        total = sum(len(v) for v in alive_mbt.values())
-        counts = _counts(alive_mbt)
-        with db() as conn:
-            conn.execute(
-                "UPDATE history SET total=?, counts=? WHERE id IN "
-                "(SELECT MAX(id) FROM history WHERE keyword=? GROUP BY username)",
-                (total, counts, keyword))
-    except Exception as e:
-        logger.warning("rewrite history counts error kw=%s: %s", keyword, e)
-
-
 async def _bg_deep_verify(keyword: str, mbt: dict):
     """B：首屏返回后，后台把该词剩余链接全量验证（受 VERIFY_BG_LIMIT 安全阀约束、
     跨请求 in-flight 去重、信号量限流复用 VERIFY_WORKERS）。死链落库并移出 FTS，
@@ -1194,8 +1185,8 @@ async def _bg_deep_verify(keyword: str, mbt: dict):
                          for d, its in (mbt or {}).items() for it in its}
             for u, st in verdict.items():
                 metrics.record_verify(url_drive.get(u, "unknown"), st)
-            # 死链/复活定性后回写该词历史计数，消除「历史 88 vs 前台 82」的漂移
-            _rewrite_history_counts(keyword, mbt)
+            # 历史只冻结用户当次实际收到的响应快照（record 时已剔除死链）；
+            # 后台新定性的死链仅维护死链表/FTS，下次搜索自然剔除，不回溯改写当次历史
         finally:
             _verify_inflight.difference_update(todo)
     except Exception as e:
@@ -1505,9 +1496,27 @@ async def _stream_proxy(request: Request, path: str):
         return JSONResponse({"detail": "上游服务暂时不可用，请稍后重试"}, status_code=502)
 
 
+# 历史分项计数认可的标准网盘（与前端 DRIVE_ORDER 对齐）；其余任意上游新类型
+# 统一并入 other，保证 last_counts 分项之和恒等于 total，前端不会漏掉未知桶
+_HISTORY_CANONICAL = ("baidu", "quark", "aliyun", "tianyi", "uc", "115",
+                      "xunlei", "123", "pikpak", "guangya", "magnet")
+
+
 def _counts(mbt: dict):
-    return json.dumps({k: len(v) for k, v in mbt.items()
-                       if isinstance(v, list)}, ensure_ascii=False)
+    out = {}
+    other = 0
+    for k, v in (mbt or {}).items():
+        if not isinstance(v, list):
+            continue
+        n = len(v)
+        if k in _HISTORY_CANONICAL:
+            out[k] = n
+        else:
+            other += n
+    ordered = {d: out[d] for d in _HISTORY_CANONICAL if d in out}
+    if other:
+        ordered["other"] = other
+    return json.dumps(ordered, ensure_ascii=False)
 
 
 def _record_history(username, keyword, src, data):
@@ -2473,6 +2482,14 @@ def clean_title(note: str):
     s = (note or "").strip()
     if not s:
         return "", ""
+    # 先剥 URL/域名残留（磁力发布标题常带 dygod.org 等站点域名，污染 root 与豆瓣查询）；
+    # 主体限定 ASCII、TLD 走常见后缀白名单（避免误删 4K.HDR 这类点号画质词），遇中文即停
+    s = re.sub(
+        r"https?://[A-Za-z0-9.\-]+(?:/[^\s]*)?|"
+        r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\."
+        r"(?:com|cn|net|org|me|app|xyz|top|cc|io|tv|info|club|site|live|pro|vip)"
+        r"(?:/[A-Za-z0-9._~:/?#\[\]@!$&()*+,;=%-]*)?",
+        " ", s, flags=re.IGNORECASE)
     s = re.sub(r"^\s*(资源名称|文件名称|文件名|名称|资源名)\s*[:：]\s*", "", s)
     # 去掉开头的【】/[] 标签（可能多个）
     for _ in range(4):
@@ -2628,6 +2645,25 @@ async def _douban_suggest_cover(q: str, client: httpx.AsyncClient, year: str = "
         best = next((x for x in arr if x.get("img")), None)
     if not best or not best.get("img"):
         return None
+    # search 摘要在风控降级时可能只给封面/年份而缺评分：用条目 id 补一次 subject 详情，
+    # 详情接口稳定返回 rating/year（失败则静默保留摘要结果，不影响封面）。
+    sid = (best.get("id") or "").strip()
+    if sid and not best.get("rating"):
+        try:
+            dr = await client.get(REXXAR_BASE + "/subject/" + sid, headers=REXXAR_HEADERS)
+            if dr.status_code == 200:
+                det = dr.json()
+                drv = det.get("rating")
+                if isinstance(drv, dict) and drv.get("value"):
+                    best["rating"] = ("%g" % drv["value"]) if isinstance(
+                        drv["value"], (int, float)) else str(drv["value"])
+                if not best.get("year") and det.get("year"):
+                    best["year"] = str(det.get("year") or "").strip()
+                dcover = det.get("cover_url") or ""
+                if dcover and not best.get("img"):
+                    best["img"] = _normalize_douban_cover_url(dcover)
+        except Exception:
+            pass
     return {"cover": best.get("img", ""),
             "title": best.get("title", ""),
             "year": best.get("year", ""),
@@ -2654,10 +2690,11 @@ def _fb_cache_get(tkey: str):
         return e if now - e["ts"] < _fb_ttl_of(e) else None
     with db() as conn:
         r = conn.execute(
-            "SELECT cover,title,year,miss,ts FROM poster_fallback WHERE tkey=?",
+            "SELECT cover,title,year,rating,miss,ts FROM poster_fallback WHERE tkey=?",
             (tkey,)).fetchone()
     if r:
         e = {"cover": r["cover"], "title": r["title"], "year": r["year"],
+             "rating": r["rating"] or "",
              "miss": r["miss"], "ts": r["ts"], "soft": 0}
         if now - r["ts"] < _fb_ttl_of(e):
             _FB_MEM[tkey] = e
@@ -2671,6 +2708,7 @@ def _fb_cache_set(tkey: str, q: str, info, soft=False):
     e = {"cover": (info or {}).get("cover", ""),
          "title": (info or {}).get("title", ""),
          "year": (info or {}).get("year", ""),
+         "rating": (info or {}).get("rating", ""),
          "miss": 0 if info and info.get("cover") else 1,
          "soft": 1 if (soft and not (info and info.get("cover"))) else 0,
          "ts": now}
@@ -2680,12 +2718,13 @@ def _fb_cache_set(tkey: str, q: str, info, soft=False):
     try:
         with db() as conn:
             conn.execute(
-                """INSERT INTO poster_fallback(tkey,qtitle,cover,title,year,miss,ts)
-                   VALUES(?,?,?,?,?,?,?)
+                """INSERT INTO poster_fallback(tkey,qtitle,cover,title,year,rating,miss,ts)
+                   VALUES(?,?,?,?,?,?,?,?)
                    ON CONFLICT(tkey) DO UPDATE SET qtitle=excluded.qtitle,
                      cover=excluded.cover,title=excluded.title,year=excluded.year,
-                     miss=excluded.miss,ts=excluded.ts""",
-                (tkey, q, e["cover"], e["title"], e["year"], e["miss"], now))
+                     rating=excluded.rating,miss=excluded.miss,ts=excluded.ts""",
+                (tkey, q, e["cover"], e["title"], e["year"], e["rating"],
+                 e["miss"], now))
     except Exception:
         pass
 
@@ -2765,6 +2804,11 @@ async def poster_fallback(request: Request):
                 # 2) 完整词无果或本就等于 root → 查根片名（去掉演员名/类型噪声）
                 if not info:
                     info = await ask(root, year)
+                # 3) rexxar 对带空格的中文季查询（如"庆余年 第二季"）会间歇 403：
+                #    去掉" 第X季"后缀用纯片名再查一次，由 _fb_pick 按年份选中正确季。
+                bare = re.sub(r"第[一二三四五六七八九十百\d]{1,3}季", "", root).strip()
+                if not info and bare and bare != root.strip():
+                    info = await ask(bare, year)
                 if info:
                     _fb_cache_set(tkey, root, info)
                     short_empty = 0

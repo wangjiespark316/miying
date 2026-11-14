@@ -261,7 +261,9 @@ button:focus-visible,a:focus-visible{outline:2px solid var(--gold);outline-offse
 .grp-head{display:flex;align-items:center;gap:12px;width:100%;padding:15px 17px;text-align:left;
   background:transparent;cursor:pointer;color:var(--text)}
 .grp-head:hover{background:var(--surface-2)}
-.grp-title{flex:1;min-width:0;font-size:14.5px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.grp-twrap{flex:1;min-width:0}
+.grp-title{display:block;font-size:14.5px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.grp-metaline{margin-top:3px}
 .grp-meta{flex-shrink:0;display:flex;gap:6px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
 .grp-meta .gm{font-size:11px;color:var(--text-3);border:1px solid var(--line);border-radius:10px;padding:3px 8px}
 .grp-meta .gm.gold{color:var(--gold);border-color:rgba(216,167,90,.35)}
@@ -980,10 +982,23 @@ function fbFlush(){
     .then(function(res){
       var covers=(res&&res.covers)||{};
       var metas=(res&&res.meta)||{};
+      /* 同组共享：磁力等脏标题后端没查到时，复用本批同 groupKey 已命中的封面/meta，零额外请求 */
+      var gCover={},gMeta={};
       batch.forEach(function(t){
+        var gk=groupKeyOf(t);
+        if(!gk)return;
+        if(covers[t])gCover[gk]=covers[t];
+        var m0=metas[t];
+        if(m0&&(m0.rating||m0.year))gMeta[gk]=m0;
+      });
+      batch.forEach(function(t){
+        var gk=groupKeyOf(t);
         var c=covers[t]||"";
+        if(!c&&gk&&gCover[gk])c=gCover[gk];
         fbMap[t]=c;
-        if(metas[t])metaMap[t]=metas[t];
+        var mt=metas[t];
+        if((!mt||(!mt.rating&&!mt.year))&&gk&&gMeta[gk])mt=gMeta[gk];
+        if(mt)metaMap[t]=mt;
         var boxes=fbQueue[t]||[];
         for(var i=0;i<boxes.length;i++){
           if(c)fbApply(boxes[i],c);
@@ -1032,7 +1047,8 @@ function fillMetaLine(el,note){
   var parts=[];
   if(year)parts.push(year);
   if(rating)parts.push("豆瓣 "+rating);
-  if(parts.length){el.textContent=parts.join(" · ");el.style.display="";}
+  /* .meta-line 样式默认 display:none，有内容时必须显式恢复（清空 inline 会回退到 none） */
+  if(parts.length){el.textContent=parts.join(" · ");el.style.display="block";}
   else{el.textContent="";el.style.display="none";}
 }
 /* 豆瓣 meta 到达后，回填页面上所有同片名的卡片/弹窗年份评分行 */
@@ -1442,23 +1458,62 @@ function _normSeason(s){
 }
 var _GRP_STRIP=[
   /2160p|1080p|720p|480p/gi,/\b(uhd|fhd|hd|4k|8k)\b/gi,/\bremux\b/gi,
-  /杜比视界|杜比全景声|杜比|dolby[\s.]?vision|dolby|\bdovi\b/gi,
+  /杜比视界|杜比全景声|杜比|dolby[\s.]?vision|dolby|\bdovi\b|\bdv\b/gi,
   /\bhdr(10\+?|\+)?\b/gi,/\b(10bit|hevc|x264|x265|h264|h265|avc|av1)\b/gi,
   /\b(dts|truehd|atmos|aac|flac|ac3)\b/gi,
-  /\b(web-?dl|webrip|bluray|bdrip|hdrip|dvdrip)\b/gi,
-  /蓝光|原盘|国英双语|国语|粤语|双语|中字|内嵌字幕|简繁|合集|全集|完结|未删减|高清|高码率|珍藏版|修复版/g,
-  /\b(mkv|mp4|iso|ts)\b/gi,/\[[^\]]*\]/g,/【[^】]*】/g,
-  /第\s*\d+\s*[集话期]|第\s*[一二三四五六七八九十百零0-9]+\s*[集话期]|\bep?\d{1,3}\b|更新至?\s*\d+\s*[集话期]?|全\s*\d+\s*[集话期]|\d+\s*[集话期]/gi
+  /\b(web-?dl|webrip|bluray|bdrip|hdrip|dvdrip|dsnp|ma|web)\b/gi,
+  /\d+(\.\d+)?\s*(gb|tb|mb|g)\b/gi,
+  /蓝光|原盘|国英双语|国英双音轨|国英双语|国英|国语|粤语|双语|国配|官译|多音轨|双音|音轨|特效字幕|特效|简英|中英|中文字幕|内嵌字幕|内封字幕|内封|中字|字幕|简繁|简体|繁体|合集|全集|完结|未删减|无删减|删减|高清|超清|高码率|高码|珍藏版|修复版|完整版|完整|纯净版|正式版|特别版|多版本|版本|清晰|臻彩视听|臻彩|视听|音效|声效|电视剧|国产剧|国剧|美剧|英剧|日剧|韩剧|科幻片|剧情片|动作片|科幻|动作|剧情|冒险|悬疑|惊悚|奇幻|武侠|古装|历史|战争|爱情|喜剧|动画|纪录片|综艺|剧集|电影|美国|英国|韩国|日本|国产|补齐缺集|缺集|无广告版|无广告|资源名称|标题|夸克下载|夸克网盘|百度网盘|网盘|下载|刮削|超前点映|点映|补档|周年|杜比声效|奥斯卡|最佳视觉效果|视觉效果|获奖|提名|洗版/g,
+  /\b(mkv|mp4|iso|ts)\b/gi,
+  /4k|8k|hdr10\+?|hdr|dovi|dts|aac|flac|ac3/gi,
+  /第\s*\d+\s*[集话期]|第\s*[一二三四五六七八九十百零0-9]+\s*[集话期]|\bep?\d{1,3}\b|更新至?\s*\d+\s*[集话期]?|全\s*\d+\s*[集话期]|\d+\s*[-~到]\s*\d+\s*[集话期]|\d+\s*[集话期]/gi
 ];
-/* 作品归一键：季号归一保留（防不同季串片）、年份保留，剥离画质/编码/集数等修饰；
-   只做“清洗后核心名完全相等”的确定性折叠，不做模糊匹配。 */
+/* 内容隔离词：命中说明不是该作品正片（小说/漫画/有声/解说/短剧/花絮等），
+   保留在 key 中独立成组，锚点截断也不得把它们并入正片季组 */
+var _GRP_ISOLATE=/小说|电子书|txt|全文|全本|漫画|有声|解说|短剧|番外|花絮|预告|剪辑|素材|pdf|epub|mobi/i;
+/* 跨季合集标志：两季/全N季/数字范围（1-2季、1-2）/合集/系列等不参与单季锚定，
+   避免把合集并入某一季（此时「第N季」已被 _normSeason 转走，残留数字+季即合集） */
+var _GRP_MULTI=/两季|全\s*\d+\s*季|\d+\s*季|\d+\s*[-~到]\s*\d+|合集|全系列|系列/;
+/* 作品归一键：按「作品名＋季」成组。统一剥离季号写法差异（第二季/第2季/S02/片尾裸数字）、
+   发行年份、集数描述、画质音效编码词、标点与空白；只做清洗后核心名完全相等的确定性折叠，
+   不做模糊匹配。无季号的首季保持不带 s，避免与续季误并。 */
 function groupKeyOf(note){
-  var s=_normSeason((note||"").toLowerCase());
+  var s=(note||"").toLowerCase();
+  /* 0. 剥链接/域名残留（含被白名单粘连前的原始 URL 与 pan.xxx 域名片段） */
+  s=s.replace(/https?:\/\/\S+|[\w.-]+\.(?:com|cn|net|me|app|xyz|top|cc|io|org)\S*/gi," ");
+  /* 1. 剥发行年份（1950-2039 四位，连带「年」字），年份只是标注、不参与成组 */
+  s=s.replace(/(?:19|20)\d{2}\s*年?/g," ");
+  /* 评分（8.3 分）与「第N届」奖项/排名，不是季号 */
+  s=s.replace(/\d+\.\d+\s*分?/g," ").replace(/第\s*\d+\s*届/g," ");
+  /* 2. 季号写法归一：第N季（中文/阿拉伯）与 sN 统一为 sNN；此后残留的「数字+季」只可能是合集 */
+  s=_normSeason(s);
+  var multi=_GRP_MULTI.test(s);
+  /* 3. 剥画质/编码/音效/集数/体积/容器格式等修饰（括号不整块删除，仅在下一步转空格，保留括号内片名） */
   for(var i=0;i<_GRP_STRIP.length;i++){s=s.replace(_GRP_STRIP[i]," ");}
-  /* 白名单归一：只保留中文/英文/数字，emoji、书名号、&、+、括号等未枚举符号
-     一律剔除，避免「🗄 庆余年2…」与「【标题】：庆余年2…」因残留符号漏折叠 */
-  s=s.replace(/[^0-9a-z一-龥]+/g,"").trim();
-  return s;
+  /* 括号/标点/emoji 等非白名单字符转空格，再压空白；独立「全」字（36集全 残留）去掉 */
+  s=s.replace(/[^0-9a-z一-龥\s]+/g," ").replace(/(?:^|\s)全(?:\s|$)/g," ").replace(/\s+/g," ").trim();
+  /* 4. 白名单归一：只保留中文/英文/数字，得到连续串 */
+  var base=s.replace(/[^0-9a-z一-龥]+/g,"").trim();
+  if(!base)return base;
+  /* 5. 衍生/非视频内容或跨季合集：保留完整串独立成组，不做季号规整与锚点截断，防止误并 */
+  if(_GRP_ISOLATE.test(base)||multi)return base;
+  /* 6. 去前导孤立英文字母（如「Q 庆余年2」的 q，仅当其紧随中文时） */
+  base=base.replace(/^[a-z](?=[一-龥])/,"");
+  /* 去尾部残留独立「全」字（如 s02全，无空格粘连时上一步未覆盖） */
+  base=base.replace(/全+$/,"");
+  /* 7. 冗余季号去重：中文片名+裸数字+sNN（庆余年2s02）→ 庆余年s02；
+        强制裸数字紧跟中文字符，避免吞掉已规范 sNN 里的 s（庆余年s02s02 保持不动） */
+  base=base.replace(/^([一-龥a-z]*?[一-龥])\d{1,2}(s\d{2})/,"$1$2");
+  /* 8. 作品名后的裸数字统一视为季号（庆余年2 / 庆余年2演员名 → s02）；已规范 sNN（前缀为 s）不动 */
+  base=base.replace(/([一-龥a-z])(\d{1,2})(?!\d)/g,function(_,p,n){
+    if(p==="s")return _;
+    return p+"s"+(n.length<2?"0"+n:n);
+  });
+  /* 9. 以「作品名前缀＋季号」为锚截断，丢弃其后演员/版本/字幕等长尾，让同季不同命名确定性收敛 */
+  var am=base.match(/^([一-龥a-z]+?)s(\d{2})/);
+  if(am&&am[1])return am[1]+"s"+am[2];
+  /* 无季号（首季等）保持完整清洗串相等才折叠，保守不误并 */
+  return base;
 }
 function renderFilterBar(){
   var bar=document.getElementById("filterBar");
@@ -1543,10 +1598,13 @@ function renderGrouped(container,rows){
     g.items.forEach(function(it){drives[it.drive]=1;if(it.score>topScore){topScore=it.score;topTag=it.tags[0]||"";}});
     var grp=document.createElement("div");grp.className="grp";
     var head=document.createElement("button");head.className="grp-head";
+    var repNote=g.items[0].note||"";
     head.innerHTML='<svg class="grp-caret" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg>'+
-      '<span class="grp-title">'+esc(g.items[0].note||"未命名")+'</span><span class="grp-meta">'+
+      '<span class="grp-twrap"><span class="grp-title">'+esc(repNote||"未命名")+'</span>'+
+      '<span class="meta-line grp-metaline" data-meta-note="'+esc(repNote)+'"></span></span><span class="grp-meta">'+
       (topTag?'<span class="gm gold">'+esc(topTag)+'</span>':'')+
       '<span class="gm">'+g.items.length+' 个版本</span><span class="gm">'+Object.keys(drives).length+' 个网盘</span></span>';
+    fillMetaLine(head.querySelector(".grp-metaline"),repNote);
     var body=document.createElement("div");body.className="grp-body";
     var inner=document.createElement("div");inner.className=state.view==="grid"?"grid":"list";
     g.items.forEach(function(it){inner.appendChild(buildResultItem(it,state.view));});
@@ -1935,6 +1993,13 @@ function countsTextFromServer(s){
   try{
     var c=JSON.parse(s||"{}"),parts=[];
     DRIVE_ORDER.forEach(function(d){if(c[d])parts.push(driveShort(d)+c[d]);});
+    /* 后端已把未知盘归并 other；旧历史里可能仍是 mobile 等具体未知 key，一并累加为「其他」，
+       保证分项之和等于总数、不漏桶 */
+    var other=0;
+    Object.keys(c).forEach(function(k){
+      if(DRIVE_ORDER.indexOf(k)<0)other+=Number(c[k])||0;
+    });
+    if(other)parts.push("其他"+other);
     return parts.join(" · ");
   }catch(e){return "";}
 }
