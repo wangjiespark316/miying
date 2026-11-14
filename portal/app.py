@@ -1932,32 +1932,50 @@ async def public_hot():
     return {"hot": [{"keyword": r["keyword"], "c": r["n"]} for r in hot]}
 
 
-# ---------------- 全网热榜（豆瓣 j/search_subjects，直连，服务端缓存） ----------------
+# ---------------- 全网热榜（豆瓣移动端 rexxar，直连，服务端缓存） ----------------
+# movie.douban.com 的 j/search_subjects 已被边缘风控：DNS/TCP/TLS 均正常，却在 TLS
+# 握手后静默丢弃应用层响应（HTTP 000 读取超时），首页等同域接口一并不可用。改用仍
+# 开放的移动端 m.douban.com/rexxar/api/v2：电影热门取 /movie/hot_gaia，剧集热门取
+# /subject_collection/tv_hot/items。rexxar 强制校验 iOS UA + m 站 Referer，裸请求被拒。
 TRENDING_CACHE = {"ts": 0.0, "data": None}
 TRENDING_TTL = 6 * 3600
 DOUBAN_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
              "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1")
+REXXAR_BASE = "https://m.douban.com/rexxar/api/v2"
+REXXAR_HEADERS = {
+    "User-Agent": DOUBAN_UA,
+    "Referer": "https://m.douban.com/",
+    "Accept": "application/json, text/plain, */*",
+}
+
+
+def _map_rexxar_subject(it: dict) -> dict:
+    """把 rexxar 条目归一化成前端热搜契约（title/rate/ep/cover/url），缺字段安全降级。"""
+    rating = it.get("rating") or {}
+    value = rating.get("value")
+    pic = it.get("pic") or {}
+    sid = str(it.get("id") or "").strip()
+    return {
+        "title": it.get("title", "") or "",
+        "rate": (str(value) if value else ""),
+        "ep": it.get("episodes_info", "") or "",
+        "cover": pic.get("large") or pic.get("normal") or "",
+        # 豆瓣电影与剧集网页统一走 /subject/{id}/ 详情页
+        "url": ("https://movie.douban.com/subject/%s/" % sid) if sid else "",
+    }
 
 
 async def _douban_subjects(typ: str, client: httpx.AsyncClient, limit: int = 10):
-    url = ("https://movie.douban.com/j/search_subjects?type=%s&tag=%s&page_limit=%d&page_start=0"
-           % (typ, quote("热门"), limit))
-    headers = {"User-Agent": DOUBAN_UA,
-               "Referer": "https://movie.douban.com/",
-               "Accept": "application/json, text/plain, */*"}
-    r = await client.get(url, headers=headers)
+    if typ == "tv":
+        path = REXXAR_BASE + "/subject_collection/tv_hot/items"
+        list_key = "subject_collection_items"
+    else:
+        path = REXXAR_BASE + "/movie/hot_gaia"
+        list_key = "items"
+    r = await client.get(path, params={"count": limit}, headers=REXXAR_HEADERS)
     r.raise_for_status()
-    d = r.json()
-    out = []
-    for it in d.get("subjects", [])[:limit]:
-        out.append({
-            "title": it.get("title", ""),
-            "rate": (it.get("rate") or ""),
-            "ep": it.get("episodes_info", "") or "",
-            "cover": it.get("cover", "") or "",
-            "url": it.get("url", "") or "",
-        })
-    return out
+    rows = r.json().get(list_key) or []
+    return [_map_rexxar_subject(it) for it in rows[:limit] if isinstance(it, dict)]
 
 
 @app.get("/portal/api/public/trending")
