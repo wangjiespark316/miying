@@ -46,7 +46,7 @@ logger = logging.getLogger("portal")
 UPSTREAM = os.environ.get("PANSOU_UPSTREAM", "http://pansou").rstrip("/")
 DB_PATH = os.environ.get("DB_PATH", "/app/data/portal.db")
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
-APP_VERSION = os.environ.get("APP_VERSION", "0.5.1")
+APP_VERSION = os.environ.get("APP_VERSION", "0.5.2")
 
 # SQLite 在线备份：启动一份 + 每日轮转，Connection.backup() 在 WAL 下也保证一致性
 BACKUP_ENABLED = bool(int(os.environ.get("BACKUP_ENABLED", "1")))
@@ -195,10 +195,11 @@ FTS_JOB_TTL = int(os.environ.get("FTS_JOB_TTL", str(6 * 3600)))             # �
 FTS_STARTUP_DELAY = int(os.environ.get("FTS_STARTUP_DELAY", "120"))          # 启动后延迟
 FTS_MIN_HITS = int(os.environ.get("FTS_MIN_HITS", "8"))                      # 本地命中足够阈值
 FTS_MAX_WORDS = int(os.environ.get("FTS_MAX_WORDS", "30"))                   # 每轮最多填充词数
-FTS_MAX_ARTS_PER_WORD = int(os.environ.get("FTS_MAX_ARTS_PER_WORD", "60"))   # 每词最多入库
+FTS_MAX_ARTS_PER_WORD = int(os.environ.get("FTS_MAX_ARTS_PER_WORD", "90"))   # 每词最多入库
+FTS_PER_DRIVE_FLOOR = int(os.environ.get("FTS_PER_DRIVE_FLOOR", "8"))        # 每网盘保底入库条数
 FTS_ART_TTL = int(os.environ.get("FTS_ART_TTL", str(45 * 86400)))            # 条目过期清理
 FTS_WORD_GAP = float(os.environ.get("FTS_WORD_GAP", "1.5"))                  # 词间间隔
-FTS_QUERY_LIMIT = int(os.environ.get("FTS_QUERY_LIMIT", "80"))               # 本地查询返回上限
+FTS_QUERY_LIMIT = int(os.environ.get("FTS_QUERY_LIMIT", "120"))              # 本地查询返回上限
 # 热搜/热榜覆盖不到的固定常用词（热门 / 经典画质标杆，与 warm-cache 对齐）
 FTS_STATIC_WORDS = ["沙丘2", "阿凡达", "让子弹飞", "奥本海默", "流浪地球2",
                     "满江红", "封神第一部", "年会不能停", "热辣滚烫",
@@ -3267,9 +3268,51 @@ async def change_password(request: Request):
 
 
 # ---------------- 混合 FTS5 预索引：写入 / 查询 / 清理 ----------------
+def _fts_quota_rows(best: dict, cap: int, floor: int):
+    """分网盘配额选行，修复"拍平后按上游顺序整体截断"导致靠后网盘被整桶饿死。
+    best: {url: (drive, item, score)}（已按 url 去重、同 url 取高分）。
+    规则：①每个网盘先保底 min(floor, 该桶条数) 条，round-robin 均匀选取且受 cap
+    约束，桶内按画质分降序（稳定，平分保持上游顺序）；②剩余名额再按画质分全局
+    降序补满至 cap。返回 [(drive, item, score), ...]，url 唯一。"""
+    per_drive, drive_order = {}, []
+    for url, (drive, it, sc) in best.items():
+        if drive not in per_drive:
+            per_drive[drive] = []
+            drive_order.append(drive)
+        per_drive[drive].append((drive, it, sc))
+    for drive in drive_order:
+        per_drive[drive].sort(key=lambda x: x[2], reverse=True)
+    selected = {}
+
+    def _take(row):
+        u = (row[1].get("url") or "").strip()
+        if u and u not in selected:
+            selected[u] = row
+
+    # ① 每网盘保底：逐轮从每个桶各取 1 条，直到各桶取够 floor 或达到 cap
+    for k in range(max(0, floor)):
+        for drive in drive_order:
+            if len(selected) >= cap:
+                break
+            lst = per_drive[drive]
+            if k < len(lst):
+                _take(lst[k])
+        if len(selected) >= cap:
+            break
+    # ② 余量按画质分全局降序补满（sorted 稳定，平分保持桶/上游顺序）
+    if len(selected) < cap:
+        all_rows = [row for lst in per_drive.values() for row in lst]
+        for row in sorted(all_rows, key=lambda x: x[2], reverse=True):
+            if len(selected) >= cap:
+                break
+            _take(row)
+    return list(selected.values())
+
+
 def _fts_upsert(kw: str, mbt: dict):
     """把一次 PanSou 搜索结果（merged_by_type）幂等写入 idx_arts + idx_fts。
-    按 url 去重，同 url 保留画质分高的；kw 关联进 kws（一条资源可被多个词命中）。"""
+    按 url 去重，同 url 保留画质分高的；kw 关联进 kws（一条资源可被多个词命中）。
+    选行走 _fts_quota_rows 分网盘保底，避免靠后/大桶网盘被整体截断。"""
     if not FTS_ENABLED:
         return 0
     best = {}
@@ -3283,7 +3326,7 @@ def _fts_upsert(kw: str, mbt: dict):
                 best[url] = (drive, it, sc)
     if not best:
         return 0
-    rows = list(best.values())[:FTS_MAX_ARTS_PER_WORD]
+    rows = _fts_quota_rows(best, FTS_MAX_ARTS_PER_WORD, FTS_PER_DRIVE_FLOOR)
     n = 0
     now = time.time()
     with db() as conn:
