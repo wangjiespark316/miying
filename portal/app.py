@@ -24,7 +24,7 @@ import sqlite3
 import time
 from collections import deque
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from urllib.parse import quote, urlencode, parse_qsl, urlparse
 from email.utils import formatdate as rfc822_date
 from xml.sax.saxutils import escape as xml_escape
@@ -46,7 +46,7 @@ logger = logging.getLogger("portal")
 UPSTREAM = os.environ.get("PANSOU_UPSTREAM", "http://pansou").rstrip("/")
 DB_PATH = os.environ.get("DB_PATH", "/app/data/portal.db")
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
-APP_VERSION = os.environ.get("APP_VERSION", "0.4.0")
+APP_VERSION = os.environ.get("APP_VERSION", "0.5.0")
 
 # SQLite 在线备份：启动一份 + 每日轮转，Connection.backup() 在 WAL 下也保证一致性
 BACKUP_ENABLED = bool(int(os.environ.get("BACKUP_ENABLED", "1")))
@@ -82,6 +82,7 @@ if not JWT_SECRET or len(JWT_SECRET) < 32:
 
 # Bark 滥用告警
 BARK_KEY = os.environ.get("BARK_KEY", "")
+BARK_DEFAULT_SERVER = os.environ.get("BARK_SERVER", "https://api.day.app")
 RATE_WINDOW_SEC = int(os.environ.get("RATE_WINDOW_SEC", "600"))
 RATE_WINDOW_MAX = int(os.environ.get("RATE_WINDOW_MAX", "60"))
 RATE_DAY_MAX = int(os.environ.get("RATE_DAY_MAX", "500"))
@@ -151,6 +152,38 @@ POSTER_PROXY_HOSTS = {"telesco.pe"}
 DEFAULT_EXCLUDE = ["预告", "花絮", "枪版", "抢先", "偷拍", "解说",
                    "速看", "片花", "宣传片", "抢先版", "tc版", "hdcam",
                    "cam版", "ts版", "高清预告"]
+# 门户侧二次过滤补充词：上游 exclude 对衍生有声读物/短剧解说拦不住，响应前再兜一遍
+EXTRA_EXCLUDE = ["有声书", "有声小说", "有声读物", "有声剧", "广播剧", "听书",
+                 "评书", "电影解说", "剧集解说", "剧情解说", "几分钟看完",
+                 "短剧解说", "番外解说"]
+
+
+def _clean_is_noise(note: str, keyword: str) -> bool:
+    """只看正片模式的标题级确定性判断（纯规则，不依赖 AI）。
+    1) 命中默认/补充噪音词；2) 同名衍生短剧「<片名>之<副标题>」（如搜「庆余年」
+       时的「庆余年之帝王业」），正片「庆余年2/第二季」不含「之」不会误伤。"""
+    text = (note or "").lower()
+    for w in DEFAULT_EXCLUDE + EXTRA_EXCLUDE:
+        if w.lower() in text:
+            return True
+    root = (keyword or "").strip()
+    if len(root) >= 2:
+        pat = r"(?:^|[《【\[\s(（])" + re.escape(root) + r"\s*之[一-龥A-Za-z0-9]"
+        if re.search(pat, note or ""):
+            return True
+    return False
+
+
+def _apply_clean_filter(mbt: dict, keyword: str):
+    """对 merged_by_type 就地做正片过滤，丢弃清空的网盘桶，返回 (新mbt, 剔除数)。"""
+    out, dropped = {}, 0
+    for drive, items in (mbt or {}).items():
+        kept = [it for it in items
+                if not _clean_is_noise(it.get("note", ""), keyword)]
+        dropped += len(items) - len(kept)
+        if kept:
+            out[drive] = kept
+    return out, dropped
 
 # ---------------- 混合 FTS5 预索引 ----------------
 # 平时把"全网热榜 + 高频搜索词 + 追剧词 + 固定常用词"的 PanSou 结果持久化进本地
@@ -315,7 +348,23 @@ def _magnet_item(name: str, info_hash: str, source: str,
         "note": note,
         "source": "plugin:" + source,
         "datetime": "",
+        "size": size or "",
     }
+
+
+def _human_size(num) -> str:
+    """字节数转人类可读体积；无法解析返回空串。"""
+    try:
+        n = float(num)
+    except (TypeError, ValueError):
+        return ""
+    if n <= 0:
+        return ""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return ("%g" % n) + ("" if unit == "B" else " " + unit)
+        n /= 1024
+    return ""
 
 
 async def _fetch_apibay(kw: str, to: httpx.Timeout) -> list:
@@ -338,7 +387,8 @@ async def _fetch_apibay(kw: str, to: httpx.Timeout) -> list:
             seeds = int(r.get("seeders") or 0)
         except Exception:
             seeds = 0
-        out.append((seeds, _magnet_item(name, ih, "apibay", seeds)))
+        out.append((seeds, _magnet_item(
+            name, ih, "apibay", seeds, _human_size(r.get("size")))))
     out.sort(key=lambda x: -x[0])
     return [it for _, it in out[:MAGNET_APIBAY_MAX]]
 
@@ -372,7 +422,7 @@ async def _fetch_yts(kw: str, to: httpx.Timeout) -> list:
             tags = " / ".join(x for x in (q, typ, size) if x)
             if tags:
                 name = "%s [%s]" % (name, tags)
-            out.append((seeds, _magnet_item(name, h, "yts", seeds)))
+            out.append((seeds, _magnet_item(name, h, "yts", seeds, size)))
     out.sort(key=lambda x: -x[0])
     return [it for _, it in out[:MAGNET_YTS_MAX]]
 
@@ -550,6 +600,12 @@ def init_db():
         db.execute("""CREATE TABLE IF NOT EXISTS rss_feed(
             username TEXT PRIMARY KEY, token TEXT UNIQUE NOT NULL,
             created_ts TEXT NOT NULL)""")
+        # 用户级 Bark：未配置时回退站长默认 BARK_KEY；server 可指向自建 Bark 服务
+        db.execute("""CREATE TABLE IF NOT EXISTS user_bark(
+            username TEXT PRIMARY KEY,
+            server TEXT NOT NULL DEFAULT '',
+            bark_key TEXT NOT NULL DEFAULT '',
+            updated_ts TEXT NOT NULL)""")
         db.execute("""CREATE TABLE IF NOT EXISTS users(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
@@ -817,6 +873,38 @@ def now_ts() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S")
 
 
+# 容器以 UTC 运行，库内 TEXT 时间均为无时区标记的 UTC 墙上时间。
+# 对外输出统一换算为北京时区并显式带偏移，前端可直接 new Date() 正确本地化。
+BJ_TZ = timezone(timedelta(hours=8))
+
+
+def _iso_bj(ts) -> str:
+    """naive(按 UTC 解释) 或带偏移的时间字符串，统一转 +08:00 ISO8601；空值/异常安全。"""
+    if ts is None:
+        return ""
+    s = str(ts).strip()
+    if not s:
+        return ""
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00").replace(" ", "T"))
+    except Exception:
+        return s
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(BJ_TZ).isoformat(timespec="seconds")
+
+
+def _epoch_bj(epoch) -> str:
+    """Unix 秒（可为小数）转 +08:00 ISO8601；空值/异常安全。"""
+    if epoch is None:
+        return ""
+    try:
+        return datetime.fromtimestamp(float(epoch), tz=BJ_TZ).isoformat(
+            timespec="seconds")
+    except Exception:
+        return str(epoch)
+
+
 def quality_score(item: dict) -> int:
     text = ((item.get("note") or "") + " " + (item.get("url") or "")).lower()
     return sum(w for t, w in QUALITY_SCORE if t in text)
@@ -1056,6 +1144,22 @@ def _pending(urls: list) -> list:
             if not (u in _verify_cache and now - _verify_cache[u][1] < VERIFY_CACHE_TTL)]
 
 
+def _rewrite_history_counts(keyword: str, mbt: dict):
+    """后台验证定性后，按最新持久化死链集合重算该词存活条数，回写各用户该关键词
+    最近一条历史（total/各网盘 counts），让历史计数与前台最终所见结果同源。"""
+    try:
+        alive_mbt, _ = _filter_dead_mbt(mbt)
+        total = sum(len(v) for v in alive_mbt.values())
+        counts = _counts(alive_mbt)
+        with db() as conn:
+            conn.execute(
+                "UPDATE history SET total=?, counts=? WHERE id IN "
+                "(SELECT MAX(id) FROM history WHERE keyword=? GROUP BY username)",
+                (total, counts, keyword))
+    except Exception as e:
+        logger.warning("rewrite history counts error kw=%s: %s", keyword, e)
+
+
 async def _bg_deep_verify(keyword: str, mbt: dict):
     """B：首屏返回后，后台把该词剩余链接全量验证（受 VERIFY_BG_LIMIT 安全阀约束、
     跨请求 in-flight 去重、信号量限流复用 VERIFY_WORKERS）。死链落库并移出 FTS，
@@ -1090,6 +1194,8 @@ async def _bg_deep_verify(keyword: str, mbt: dict):
                          for d, its in (mbt or {}).items() for it in its}
             for u, st in verdict.items():
                 metrics.record_verify(url_drive.get(u, "unknown"), st)
+            # 死链/复活定性后回写该词历史计数，消除「历史 88 vs 前台 82」的漂移
+            _rewrite_history_counts(keyword, mbt)
         finally:
             _verify_inflight.difference_update(todo)
     except Exception as e:
@@ -1232,20 +1338,74 @@ def maybe_alert(ip: str, reason: str):
             logger.warning("bark failed: %s", e)
 
 
-def push_bark(title: str, body: str, group: str = "觅影", url: str = ""):
-    """通用 Bark 推送（追剧更新等）。失败不影响主流程。
-    url 非空时，点击通知可直接打开对应网盘链接。"""
-    if not BARK_KEY:
-        return
+_BARK_HOST_RE = re.compile(
+    r"^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?)*$"
+)
+
+
+def _bark_norm_server(server: str) -> str:
+    """规范化 Bark 服务器地址：补协议、去尾斜杠，非法时回退官方域名。"""
+    s = (server or "").strip()
+    if s and not s.lower().startswith(("http://", "https://")):
+        s = "https://" + s
     try:
-        q = (f"https://api.day.app/{BARK_KEY}/{quote(title)}/{quote(body)}"
+        # 只承认单个 ://，拦掉补协议后畸形的 https://ftp://x.com 这类
+        p = urlparse(s)
+        if p.scheme in ("http", "https") and p.netloc and len(s) <= 200 \
+                and s.count("://") == 1:
+            host = p.hostname or ""
+            ok_host = bool(_BARK_HOST_RE.match(host)) or (
+                ":" in host and all(c in "0123456789abcdefABCDEF:" for c in host))
+            if ok_host:
+                p.port  # 非法端口会抛 ValueError，落到下方回退
+                return s.rstrip("/")
+    except Exception:
+        pass
+    return BARK_DEFAULT_SERVER
+
+
+def _bark_send(server: str, key: str, title: str, body: str,
+               group: str = "觅影", url: str = "") -> bool:
+    """向指定 Bark 服务器/密钥发一条推送，成功返回 True；网络异常返回 False。"""
+    key = (key or "").strip()
+    if not key:
+        return False
+    base = _bark_norm_server(server)
+    try:
+        q = (f"{base}/{quote(key)}/{quote(title)}/{quote(body)}"
              f"?group={quote(group)}")
         if url:
             q += f"&url={quote(url, safe='')}"
         with httpx.Client(timeout=10.0) as c:
-            c.get(q)
+            resp = c.get(q)
+        return 200 <= resp.status_code < 300
     except Exception as e:
-        logger.warning("push_bark failed: %s", e)
+        logger.warning("bark send failed: %s", e)
+        return False
+
+
+def push_bark(title: str, body: str, group: str = "觅影", url: str = ""):
+    """通用 Bark 推送（追剧更新等），走站长默认通道。失败不影响主流程。
+    url 非空时，点击通知可直接打开对应网盘链接。"""
+    if not BARK_KEY:
+        return
+    _bark_send(BARK_DEFAULT_SERVER, BARK_KEY, title, body, group, url)
+
+
+def _user_bark_get(username: str):
+    """返回用户自定义 Bark 配置 {server,key}，未配置返回 None。"""
+    try:
+        with db() as conn:
+            r = conn.execute(
+                "SELECT server,bark_key FROM user_bark WHERE username=?",
+                (username,)).fetchone()
+        if r and (r["bark_key"] or "").strip():
+            return {"server": r["server"] or BARK_DEFAULT_SERVER,
+                    "key": r["bark_key"].strip()}
+    except Exception as e:
+        logger.warning("user bark get failed: %s", e)
+    return None
 
 
 def _is_private_ip(ip: str) -> bool:
@@ -1828,20 +1988,24 @@ class _CircuitOpen(Exception):
     """熔断打开期间的内部快速失败信号。"""
 
 
-def _local_fallback_response(local_mbt, username, keyword, src, ip, reason):
+def _local_fallback_response(local_mbt, username, keyword, src, ip, reason,
+                             clean_on=True):
     """回源不可用（熔断打开/网络失败）时用本地 FTS 存量兜底，有多少给多少。
     无任何本地存量则返回 None，由调用方回 5xx。"""
     if not local_mbt:
         return None
     mbt, deduped = _dedup_mbt(local_mbt)
     mbt, dead_hidden = _filter_dead_mbt(mbt)
+    clean_hidden = 0
+    if clean_on:
+        mbt, clean_hidden = _apply_clean_filter(mbt, keyword)
     total = sum(len(v) for v in mbt.values())
     if not total:
         return None
     data = {"merged_by_type": mbt, "total": total,
             "verified": {"checked": 0, "removed": dead_hidden,
                          "deduped": deduped, "source": "local-fallback",
-                         "degraded": reason}}
+                         "clean_hidden": clean_hidden, "degraded": reason}}
     _record_history(username, keyword, src, data)
     _record_event(ip, keyword, src, data)
     check_abuse(ip, keyword, username)
@@ -1861,6 +2025,7 @@ async def _search_proxy(request: Request, username: str):
     qs = dict(request.query_params)
     keyword = qs.get("kw", "")
     src = qs.get("src", "all")
+    clean_on = qs.get("clean", "1") != "0"
     ip = client_ip(request)
     body = await request.body()
     target_url, body = _inject_clean_filter(request, body)
@@ -1890,6 +2055,10 @@ async def _search_proxy(request: Request, username: str):
             # C：本地结果同样做同版本去重；A+B：先剔除已确认死链，再后台全量净化
             local_mbt, local_deduped = _dedup_mbt(local_mbt)
             local_mbt, local_dead_hidden = _filter_dead_mbt(local_mbt)
+            local_clean_hidden = 0
+            if clean_on:
+                local_mbt, local_clean_hidden = _apply_clean_filter(
+                    local_mbt, keyword)
             local_total = sum(len(v) for v in local_mbt.values())
             # 后台刷新（TTL 过期回源 + 验证剔除失效），本次响应不等待
             bg = asyncio.create_task(_fts_bg_refresh(keyword))
@@ -1900,7 +2069,9 @@ async def _search_proxy(request: Request, username: str):
             deep.add_done_callback(_background_tasks.discard)
             data = {"merged_by_type": local_mbt, "total": local_total,
                     "verified": {"checked": 0, "removed": local_dead_hidden,
-                                 "deduped": local_deduped, "source": "local"}}
+                                 "deduped": local_deduped,
+                                 "clean_hidden": local_clean_hidden,
+                                 "source": "local"}}
             if local_total:
                 _record_history(username, keyword, src, data)
             _record_event(ip, keyword, src, data)
@@ -1927,7 +2098,7 @@ async def _search_proxy(request: Request, username: str):
     if not cb.allow():
         metrics.upstream_short += 1
         fb = _local_fallback_response(local_mbt, username, keyword, src, ip,
-                                      "circuit-open")
+                                      "circuit-open", clean_on)
         if fb is not None:
             return fb
         return JSONResponse(
@@ -2019,12 +2190,16 @@ async def _search_proxy(request: Request, username: str):
                         metrics.record_verify(url_drive.get(u, "unknown"), st)
                 # A+B：本次新判死链 + 历史已确认死链统一剔除（含持久化结果）
                 mbt, removed = _filter_dead_mbt(mbt)
+                clean_hidden = 0
+                if clean_on:
+                    mbt, clean_hidden = _apply_clean_filter(mbt, keyword)
                 data["merged_by_type"] = mbt
                 data["total"] = sum(
                     len(v) for v in data.get("merged_by_type", {}).values())
                 data["verified"] = {
                     "checked": len(check_urls), "removed": removed,
                     "deduped": deduped, "source": "upstream",
+                    "clean_hidden": clean_hidden,
                     "variants": v_count, "recalled": v_added}
                 metrics.search_total += 1
                 metrics.search_upstream += 1
@@ -2054,7 +2229,7 @@ async def _search_proxy(request: Request, username: str):
         cb.record_failure()
         metrics.upstream_fail += 1
         fb = _local_fallback_response(local_mbt, username, keyword, src, ip,
-                                      "upstream-error")
+                                      "upstream-error", clean_on)
         if fb is not None:
             return fb
         return JSONResponse({"detail": "搜索服务暂时不可用，请稍后重试"},
@@ -2428,9 +2603,20 @@ async def _douban_suggest_cover(q: str, client: httpx.AsyncClient, year: str = "
         if not isinstance(t, dict) or not t.get("title"):
             continue
         cover = t.get("cover_url") or ""
+        rv = t.get("rating")
+        rate = ""
+        if isinstance(rv, dict):
+            v = rv.get("value")
+            if isinstance(v, (int, float)):
+                rate = "%g" % v
+            elif v:
+                rate = str(v)
+        elif rv:
+            rate = str(rv)
         arr.append({
             "title": t.get("title", "") or "",
             "year": str(t.get("year") or "").strip(),
+            "rating": rate,
             "img": _normalize_douban_cover_url(cover) if cover else "",
             "id": str(t.get("id") or "").strip(),
         })
@@ -2444,7 +2630,8 @@ async def _douban_suggest_cover(q: str, client: httpx.AsyncClient, year: str = "
         return None
     return {"cover": best.get("img", ""),
             "title": best.get("title", ""),
-            "year": best.get("year", "")}
+            "year": best.get("year", ""),
+            "rating": best.get("rating", "")}
 
 
 def _fb_key(q: str):
@@ -2513,7 +2700,7 @@ async def poster_fallback(request: Request):
         payload = {}
     raw_titles = payload.get("titles") if isinstance(payload, dict) else None
     if not isinstance(raw_titles, list):
-        return {"covers": {}}
+        return {"covers": {}, "meta": {}}
     seen, uniq = set(), []
     for t in raw_titles:
         t = str(t).strip()
@@ -2546,6 +2733,7 @@ async def poster_fallback(request: Request):
             g["q"], g["year"] = q, year
 
     covers = {}
+    meta = {}            # 原标题 -> {cover,year,rating}，与封面同一次补全、共用缓存
     http_used = 0          # 本次已发起的豆瓣 HTTP 请求数
     short_empty = 0        # 连续"干净短片名也空"的 root 数（疑似限流信号）
     async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=5.0)) as client:
@@ -2591,7 +2779,12 @@ async def poster_fallback(request: Request):
             if cached and cached.get("cover"):
                 for raw in g["raws"]:
                     covers[raw] = cached["cover"]
-    return {"covers": covers}
+                    meta[raw] = {
+                        "cover": cached.get("cover", ""),
+                        "year": cached.get("year", ""),
+                        "rating": cached.get("rating", ""),
+                    }
+    return {"covers": covers, "meta": meta}
 
 
 # ---------------- 登录 / 当前用户 ----------------
@@ -2679,7 +2872,13 @@ async def list_history(request: Request):
                FROM history h1 WHERE username=?
                GROUP BY keyword ORDER BY last_ts DESC LIMIT 200""",
             (u,)).fetchall()
-    return {"items": [dict(r) for r in rows]}
+    items = []
+    for r in rows:
+        row = dict(r)
+        # 库内为 UTC naive，统一带 +08:00 输出，前端显示「刚刚/X 分钟前」不再差 8 小时
+        row["last_ts"] = _iso_bj(row.get("last_ts"))
+        items.append(row)
+    return {"items": items}
 
 
 @app.delete("/portal/api/history/{kw}")
@@ -2840,7 +3039,9 @@ async def admin_stats(request: Request):
                    "retry_resolved": metrics.retry_resolved,
                    "retry_giveup": metrics.retry_giveup},
         "drive_health": drive_health,
-        "source_health": [dict(r) for r in src_rows],
+        "source_health": [
+            {**dict(r), "updated_text": _epoch_bj(r["updated"])}
+            for r in src_rows],
         "storage": {"db_bytes": db_bytes,
                     "imgcache_bytes": _dir_size(POSTER_CACHE_DIR),
                     "fts_arts": fts_arts, "fts_jobs": fts_jobs,
@@ -3252,6 +3453,74 @@ async def _watch_baseline(kw: str):
     return "", 0
 
 
+@app.get("/portal/api/bark/config")
+async def bark_config(request: Request):
+    """读取当前用户 Bark 配置；密钥不回传明文，仅给掩码与是否已配置。"""
+    u = require_user(request)
+    cfg = _user_bark_get(u)
+    base = {"has_default": bool(BARK_KEY)}
+    if not cfg:
+        return {**base, "configured": False,
+                "server": BARK_DEFAULT_SERVER, "key_hint": ""}
+    k = cfg["key"]
+    hint = (k[:4] + "****") if len(k) > 4 else "****"
+    return {**base, "configured": True, "server": cfg["server"],
+            "key_hint": hint}
+
+
+@app.post("/portal/api/bark/config")
+async def bark_config_save(request: Request):
+    """保存用户 Bark 服务器/密钥。key 留空表示保持原密钥；clear=true 清除自定义，
+    回退站长默认通道。"""
+    u = require_user(request)
+    payload = await _json_body(request)
+    clear = bool(payload.get("clear"))
+    server = _bark_norm_server(payload.get("server") or BARK_DEFAULT_SERVER)
+    key = str(payload.get("key") or "").strip()[:120]
+    with db() as conn:
+        if clear:
+            conn.execute("DELETE FROM user_bark WHERE username=?", (u,))
+            return {"configured": False, "server": BARK_DEFAULT_SERVER,
+                    "has_default": bool(BARK_KEY), "key_hint": ""}
+        row = conn.execute(
+            "SELECT bark_key FROM user_bark WHERE username=?",
+            (u,)).fetchone()
+        if not key and not (row and row["bark_key"]):
+            raise _AuthError(400, {"detail": "请填写 Bark 密钥"})
+        conn.execute(
+            "INSERT INTO user_bark(username,server,bark_key,updated_ts) "
+            "VALUES(?,?,?,?) ON CONFLICT(username) DO UPDATE SET "
+            "server=excluded.server, "
+            "bark_key=COALESCE(NULLIF(excluded.bark_key,''),user_bark.bark_key), "
+            "updated_ts=excluded.updated_ts",
+            (u, server, key, now_ts()))
+    cfg = _user_bark_get(u)
+    k = cfg["key"] if cfg else ""
+    hint = (k[:4] + "****") if len(k) > 4 else "****"
+    return {"configured": True, "server": cfg["server"] if cfg else server,
+            "has_default": bool(BARK_KEY), "key_hint": hint}
+
+
+@app.post("/portal/api/bark/test")
+async def bark_test(request: Request):
+    """发送一条测试推送：优先用户自定义通道，未配置则沿用站长默认。"""
+    u = require_user(request)
+    cfg = _user_bark_get(u)
+    if cfg:
+        server, key, channel = cfg["server"], cfg["key"], "user"
+    elif BARK_KEY:
+        server, key, channel = BARK_DEFAULT_SERVER, BARK_KEY, "default"
+    else:
+        raise _AuthError(400, {
+            "detail": "尚未配置 Bark 密钥，且站长未启用默认通道"})
+    ok = await asyncio.to_thread(
+        _bark_send, server, key, "觅影·测试推送",
+        "这是一条测试消息，收到即说明 Bark 配置正确。", "觅影")
+    if not ok:
+        raise _AuthError(502, {"detail": "推送失败，请检查服务器地址与密钥"})
+    return {"ok": True, "channel": channel}
+
+
 @app.get("/portal/api/watch")
 async def list_watch(request: Request):
     u = require_user(request)
@@ -3259,7 +3528,13 @@ async def list_watch(request: Request):
         rows = conn.execute(
             "SELECT id,keyword,last_ts,last_total,created_ts,status FROM watch "
             "WHERE username=? ORDER BY id DESC", (u,)).fetchall()
-    return {"items": [dict(r) for r in rows]}
+    items = []
+    for r in rows:
+        row = dict(r)
+        row["last_ts"] = _iso_bj(row.get("last_ts"))
+        row["created_ts"] = _iso_bj(row.get("created_ts"))
+        items.append(row)
+    return {"items": items}
 
 
 @app.post("/portal/api/watch")
@@ -3423,8 +3698,57 @@ def _jsonrpc_error(req_id, code: int, message: str):
             "error": {"code": code, "message": message}}
 
 
-def _shape_mcp_results(mbt: dict, limit: int):
-    """merged_by_type 展平为 AI 客户端易读的精简列表，跳过空链接并按上限截断。"""
+_MCP_YEAR_RE = re.compile(r"(?:19|20)\d{2}")
+
+
+def _mcp_year_in_text(text: str) -> str:
+    m = _MCP_YEAR_RE.search(text or "")
+    return m.group(0) if m else ""
+
+
+def _mcp_safe_drive(drive) -> str:
+    d = str(drive or "").strip().lower()
+    return d if re.fullmatch(r"[a-z0-9]{1,16}", d) else ""
+
+
+def _split_quality_query(keyword: str):
+    """把『沙丘2 4K原盘』拆成干净片名('沙丘2')与命中的画质 token 列表。
+    画质词按提示处理而非片名死匹配；剥离后为空则整体回退原词，防空结果。"""
+    raw = (keyword or "").strip()
+    low = raw.lower()
+    hits = []
+    for tok in _FP_QUALITY_TOKENS:
+        if tok in low and tok not in hits:
+            hits.append(tok)
+    if not hits:
+        return raw, []
+    base = low
+    for tok in hits:
+        base = base.replace(tok, " ")
+    base = re.sub(r"[\s\[\]【】()（）_\-/·,，.。]+", " ", base)
+    base = re.sub(r"\s+", " ", base).strip()
+    if not base:
+        return raw, []
+    return base, hits
+
+
+def _mcp_filter_by_quality(mbt: dict, qtokens: list):
+    """按画质 token 保留命中条目；无任何命中时回退原集合（避免画质过严返空）。"""
+    if not qtokens:
+        return mbt
+    out = {}
+    for drive, items in (mbt or {}).items():
+        kept = [it for it in items
+                if any(t in (it.get("note") or "").lower() for t in qtokens)]
+        if kept:
+            out[drive] = kept
+    return out or mbt
+
+
+def _shape_mcp_results(mbt: dict, limit: int, meta: dict = None):
+    """merged_by_type 展平为 AI 客户端易读的精简列表，跳过空链接并按上限截断。
+    meta 为作品级豆瓣 {year, rating}；每条优先取标题内年份，缺省回退作品 meta。"""
+    meta = meta or {}
     rows, n = [], 0
     for drive, items in (mbt or {}).items():
         for it in items:
@@ -3433,13 +3757,17 @@ def _shape_mcp_results(mbt: dict, limit: int):
             url = (it.get("url") or "").strip()
             if not url:
                 continue
+            note = it.get("note") or ""
             rows.append({
-                "title": it.get("note") or "",
+                "title": note,
                 "drive": drive,
                 "url": url,
                 "password": it.get("password") or "",
                 "source": it.get("source") or "",
                 "datetime": it.get("datetime") or "",
+                "size": it.get("size") or "",
+                "year": _mcp_year_in_text(note) or meta.get("year", ""),
+                "rating": meta.get("rating", ""),
             })
             n += 1
     return rows
@@ -3455,6 +3783,9 @@ _MCP_TOOLS = [{
         "type": "object",
         "properties": {
             "keyword": {"type": "string", "description": "影视名称或资源关键词"},
+            "drive": {"type": "string",
+                      "description": "可选，限定网盘类型，如 quark/aliyun/baidu/uc/"
+                                     "tianyi/115/xunlei/magnet；不传或未知值返回全部网盘"},
             "limit": {"type": "integer", "minimum": 1,
                       "maximum": MCP_RESULT_LIMIT, "default": MCP_RESULT_LIMIT},
         },
@@ -3507,15 +3838,34 @@ async def _mcp_handle(payload):
         except (TypeError, ValueError):
             limit = MCP_RESULT_LIMIT
         limit = max(1, min(limit, MCP_RESULT_LIMIT))
+        drive = _mcp_safe_drive(args.get("drive"))
+        # 画质词（原盘/REMUX/4K/杜比视界…）按提示处理：剥离后用干净片名回源，
+        # 不再把画质词当片名死匹配，修复『沙丘2 原盘』返 0。
+        base, qtokens = _split_quality_query(keyword)
         try:
             async with httpx.AsyncClient(
                     timeout=httpx.Timeout(60.0, connect=15.0)) as client:
-                mbt = await _internal_search(keyword, client)
-            rows = _shape_mcp_results(mbt, limit)
+                mbt = await _internal_search(base, client)
+                meta = {}
+                try:
+                    info = await _douban_suggest_cover(base, client)
+                    if info:
+                        meta = {"year": info.get("year", ""),
+                                "rating": info.get("rating", "")}
+                except Exception:
+                    meta = {}
+            # 与网页端同源：先剔除已确认死链，再按网盘/画质收敛
+            mbt, _ = _filter_dead_mbt(mbt)
+            if drive:
+                mbt = {drive: mbt[drive]} if mbt.get(drive) else {}
+            mbt = _mcp_filter_by_quality(mbt, qtokens)
+            rows = _shape_mcp_results(mbt, limit, meta)
             metrics.mcp_calls += 1
             result = {
                 "content": [{"type": "text", "text": json.dumps(
-                    {"keyword": keyword, "count": len(rows), "results": rows},
+                    {"keyword": keyword, "query": base,
+                     "drive": drive or "all",
+                     "count": len(rows), "results": rows},
                     ensure_ascii=False)}],
                 "isError": False}
         except Exception as e:

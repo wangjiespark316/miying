@@ -314,6 +314,9 @@ button:focus-visible,a:focus-visible{outline:2px solid var(--gold);outline-offse
 .card .meta .t{font-size:12.5px;line-height:1.4;color:var(--text);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;min-height:34px;overflow-wrap:break-word;word-break:break-word}
 .card .meta .s{font-size:11px;color:var(--text-3);margin-top:3px;display:flex;align-items:center;gap:5px;white-space:nowrap;min-width:0;overflow:hidden}
 .card .meta .s .pwd{color:var(--gold);flex:none}
+/* 年份 · 豆瓣评分：小两号、低饱和灰，卡片/列表/弹窗全站统一 */
+.meta-line{display:none;font-size:10.5px;line-height:1.5;color:var(--text-3);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.lrow .lc .meta-line{font-size:11.5px;margin-top:2px}
 @media(hover:hover){
   .card:hover .poster{transform:translateY(-5px);box-shadow:0 22px 40px -16px rgba(0,0,0,.75)}
   .card:hover .poster img{transform:scale(1.05)}
@@ -356,6 +359,10 @@ button:focus-visible,a:focus-visible{outline:2px solid var(--gold);outline-offse
 .modal .mp .mposter{width:150px;aspect-ratio:2/3;border-radius:10px;overflow:hidden;background:var(--surface);border:1px solid var(--line);position:relative}
 .modal .mp .mposter img{position:relative;z-index:1;width:100%;height:100%;object-fit:cover}
 .modal .mp .mposter .ph{position:absolute;inset:0;z-index:0;display:flex;align-items:center;justify-content:center;color:var(--text-3)}
+.modal .mp .mposter .ph-loading{position:absolute;inset:0;z-index:0;display:flex;flex-direction:column;gap:9px;align-items:center;justify-content:center;color:var(--text-3);font-size:11px;letter-spacing:.04em}
+.modal .mp .mposter .ph-loading .spin{width:22px;height:22px;border:2px solid var(--line);border-top-color:var(--gold);border-radius:50%}
+.modal .mright .meta-line{font-size:12px;margin-top:4px}
+#mWatch.on{color:var(--gold);border-color:var(--gold)}
 .modal .mright{flex:1;min-width:0;display:flex;flex-direction:column}
 .modal .mright .drive{font-size:11.5px;letter-spacing:.12em;color:var(--gold);text-transform:uppercase;display:flex;align-items:center;gap:7px}
 .modal .mright h3{font-family:var(--serif);font-size:23px;font-weight:700;line-height:1.35;margin-top:10px}
@@ -538,6 +545,10 @@ button:focus-visible,a:focus-visible{outline:2px solid var(--gold);outline-offse
   padding:11px 14px;color:var(--text);font-size:14px;font-family:inherit;outline:none;transition:border-color .2s}
 .watch-add input:focus{border-color:var(--gold-deep)}
 .watch-add .btn-primary{width:auto;flex:none;margin-top:0;padding:0 20px;font-size:14px;white-space:nowrap;border-radius:10px;letter-spacing:.02em}
+.bark-box{margin:14px 2px 4px;padding-top:12px;border-top:1px solid var(--line)}
+.bark-box input{width:100%;margin:7px 0;background:var(--surface);border:1px solid var(--line);border-radius:10px;
+  padding:10px 12px;color:var(--text);font-size:13px;font-family:inherit;outline:none;transition:border-color .2s}
+.bark-box input:focus{border-color:var(--gold-deep)}
 .watch-tip{font-size:12px;color:var(--text-3);line-height:1.6;margin:10px 2px 2px}
 .frow{display:flex;align-items:center;gap:13px;padding:13px 16px;background:var(--surface);
   border:1px solid var(--line);border-radius:12px;margin-bottom:9px}
@@ -738,7 +749,7 @@ select.um-input{flex:0 0 auto;min-width:0;cursor:pointer}
 
   <section id="resultSection" class="hidden">
     <div class="result-meta">
-      <span class="count" aria-live="polite">找到 <b id="rTotal">0</b> 条资源</span>
+      <span class="count" aria-live="polite">找到 <b id="rTotal">0</b><span id="rTotalTail"> 条资源</span></span>
       <span class="verify" id="rVerify"></span>
       <span class="time" id="rTime"></span>
     </div>
@@ -773,6 +784,7 @@ select.um-input{flex:0 0 auto;min-width:0;cursor:pointer}
         <div class="mright">
           <div class="drive" id="mDrive"></div>
           <h3 id="mTitle"></h3>
+          <div class="meta-line" id="mMeta" data-meta-note=""></div>
           <div class="taglist" id="mTags"></div>
           <div class="minfo">
             <div class="row"><span class="k">来源</span><span class="v" id="mSource"></span></div>
@@ -797,6 +809,10 @@ select.um-input{flex:0 0 auto;min-width:0;cursor:pointer}
         <button class="clink" id="mFav">
           <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>
           <span id="mFavTxt">收藏</span>
+        </button>
+        <button class="clink" id="mWatch" title="点击在 想看 / 在看 / 看过 间切换，再次回到未订阅">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/></svg>
+          <span id="mWatchTxt">追剧</span>
         </button>
       </div>
     </div>
@@ -901,6 +917,7 @@ function fbEnqueue(note,box){
   if(!note||!box)return;
   if(Object.prototype.hasOwnProperty.call(fbMap,note)){
     if(fbMap[note])fbApply(box,fbMap[note]);
+    else if(box.querySelector&&box.querySelector(".ph-loading"))box.innerHTML=phFilm();
     return;
   }
   if(!fbQueue[note])fbQueue[note]=[];
@@ -962,13 +979,22 @@ function fbFlush(){
     .then(function(r){return r.json();})
     .then(function(res){
       var covers=(res&&res.covers)||{};
+      var metas=(res&&res.meta)||{};
       batch.forEach(function(t){
         var c=covers[t]||"";
         fbMap[t]=c;
+        if(metas[t])metaMap[t]=metas[t];
         var boxes=fbQueue[t]||[];
-        for(var i=0;i<boxes.length;i++){if(c)fbApply(boxes[i],c);}
+        for(var i=0;i<boxes.length;i++){
+          if(c)fbApply(boxes[i],c);
+          /* 弹窗加载态等不到封面时回退静态占位，避免一直转圈 */
+          else if(boxes[i].querySelector&&boxes[i].querySelector(".ph-loading")){
+            boxes[i].innerHTML=phFilm();
+          }
+        }
         delete fbQueue[t];
       });
+      applyMetaNotes();
       done();
     },function(){
       /* 接口异常：丢弃本轮批次，避免堆积阻塞；后续新卡片仍会重新入队 */
@@ -982,10 +1008,37 @@ function fbFromImg(im){
   if(box&&box.dataset.note)fbEnqueue(box.dataset.note,box);
 }
 /* 给海报容器绑定片名：有图（即便失败）交给 onerror，无图直接入队 */
+var PH_FILM_SVG='<svg viewBox="0 0 24 24" width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 4v16M17 4v16M3 9h4M3 15h4M17 9h4M17 15h4"/></svg>';
+function phFilm(){return '<div class="ph">'+PH_FILM_SVG+'</div>';}
+function phLoading(){return '<div class="ph ph-loading"><span class="spin"></span>海报加载中</div>';}
 function fbBind(box,note,hasImg){
   if(!box)return;
   box.dataset.note=note||"";
   if(!hasImg)fbEnqueue(note,box);
+}
+
+/* ================= 年份 / 豆瓣评分（与海报补全同一次请求返回 meta） ================= */
+var metaMap={};   // 片名 -> {cover,year,rating}，fbFlush 写入
+/* 零等待：先从标题本身解析四位年份（1950-2039），评分等豆瓣 meta 异步回填 */
+function parseYear(note){
+  var m=/(19[5-9]\d|20[0-3]\d)/.exec(note||"");
+  return m?m[1]:"";
+}
+function fillMetaLine(el,note){
+  if(!el)return;
+  var mm=metaMap[note]||{};
+  var year=(mm.year?String(mm.year):"")||parseYear(note);
+  var rating=mm.rating||"";
+  var parts=[];
+  if(year)parts.push(year);
+  if(rating)parts.push("豆瓣 "+rating);
+  if(parts.length){el.textContent=parts.join(" · ");el.style.display="";}
+  else{el.textContent="";el.style.display="none";}
+}
+/* 豆瓣 meta 到达后，回填页面上所有同片名的卡片/弹窗年份评分行 */
+function applyMetaNotes(){
+  var els=document.querySelectorAll("[data-meta-note]");
+  for(var i=0;i<els.length;i++){fillMetaLine(els[i],els[i].dataset.metaNote);}
 }
 
 /* ================= 登录态 / 长效令牌（服务端数据，跨设备） ================= */
@@ -1144,6 +1197,7 @@ function resetResults(){
   document.getElementById("tabs").innerHTML="";
   var fb=document.getElementById("filterBar");fb.innerHTML="";fb.style.display="none";
   document.getElementById("rTotal").textContent="0";
+  var rt0=document.getElementById("rTotalTail");if(rt0)rt0.textContent=" 条资源";
   var vf=document.getElementById("rVerify");vf.textContent="";vf.style.display="none";
   document.getElementById("rTime").textContent="";
   document.getElementById("resultSection").classList.add("hidden");
@@ -1256,6 +1310,8 @@ function doSearch(){
   if(!kw)return;
   if(_searching)return;
   _searching=true;
+  /* 新搜索重置画质筛选为「全部」，避免上一次的画质/网盘选择被带进新搜索导致空结果 */
+  state.quality="all";
   var btn=document.getElementById("searchBtn"),icon=document.getElementById("searchIcon");
   btn.disabled=true;
   icon.innerHTML='<circle cx="12" cy="12" r="9" stroke-dasharray="40" stroke-linecap="round" class="spin" style="transform-origin:center"/>';
@@ -1305,6 +1361,7 @@ function processData(merged){
     if(rows.length){state.byType[t]=rows;state.total+=rows.length;}
   });
   document.getElementById("rTotal").textContent=state.total;
+  var tail0=document.getElementById("rTotalTail");if(tail0)tail0.textContent=" 条资源";
   var el=Date.now()-state.startTime;
   document.getElementById("rTime").textContent="用时 "+el+" ms";
   var vf=document.getElementById("rVerify");
@@ -1322,8 +1379,8 @@ function processData(merged){
   }else{
     document.getElementById("emptyState").classList.add("hidden");
     document.getElementById("resultSection").classList.remove("hidden");
-    if(state.byType[state.currentType])selectType(state.currentType);
-    else{var first=availableTypes()[0];selectType(first);}
+    /* 新搜索统一回到首个可用网盘 tab，不沿用上次选择的网盘 */
+    selectType(availableTypes()[0]);
     requestAnimationFrame(scrollResultsTop);
   }
 }
@@ -1398,7 +1455,9 @@ var _GRP_STRIP=[
 function groupKeyOf(note){
   var s=_normSeason((note||"").toLowerCase());
   for(var i=0;i<_GRP_STRIP.length;i++){s=s.replace(_GRP_STRIP[i]," ");}
-  s=s.replace(/[·・.,_\-—–|/\\()（）:：;；!！?？'"’“”\s]+/g,"").trim();
+  /* 白名单归一：只保留中文/英文/数字，emoji、书名号、&、+、括号等未枚举符号
+     一律剔除，避免「🗄 庆余年2…」与「【标题】：庆余年2…」因残留符号漏折叠 */
+  s=s.replace(/[^0-9a-z一-龥]+/g,"").trim();
   return s;
 }
 function renderFilterBar(){
@@ -1440,10 +1499,12 @@ function buildResultItem(it,view){
         '<div class="cta">查看详情</div>'+
       '</div>'+
       '<div class="meta"><div class="t">'+esc(it.note||"未命名")+'</div>'+
+      '<div class="meta-line" data-meta-note="'+esc(it.note)+'"></div>'+
       '<div class="s">'+(it.pwd?'提取码 <span class="pwd">'+esc(it.pwd)+'</span>':prettySource(it.source))+'</div></div>';
     c.addEventListener("click",function(){openModal(it);});
     c.addEventListener("keydown",function(e){if(e.key==="Enter"||e.key===" "){e.preventDefault();openModal(it);}});
     fbBind(c.querySelector(".poster"),it.note,!!img);
+    fillMetaLine(c.querySelector(".meta-line"),it.note);
     var fb=c.querySelector(".fav");
     if(fb)fb.addEventListener("click",function(e){e.stopPropagation();toggleFav(it,fb);});
     return c;
@@ -1454,6 +1515,7 @@ function buildResultItem(it,view){
   row.innerHTML=
     '<div class="lp"><div class="dt">'+esc(driveShort(it.drive))+'</div>'+(img?'<img src="'+esc(img)+'" referrerpolicy="no-referrer" loading="lazy" onerror="retryImg(this)">':'')+'</div>'+
     '<div class="lc"><div class="lt">'+esc(it.note||"未命名")+'</div>'+
+    '<div class="meta-line" data-meta-note="'+esc(it.note)+'"></div>'+
     '<div class="ls">'+(it.pwd?'<span class="pwd">提取码 '+esc(it.pwd)+'</span>':'')+'<span class="lsrc">'+esc(prettySource(it.source))+'</span><span class="ldate">'+esc(fmtDate(it.datetime))+'</span></div></div>'+
     (it.tags[0]?'<span class="ltag">'+esc(it.tags[0])+'</span>':'')+
     '<span class="lfav" data-fav="1">'+(favMap[it.url]?'<svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>')+'</span>'+
@@ -1461,6 +1523,7 @@ function buildResultItem(it,view){
   row.addEventListener("click",function(){openModal(it);});
   row.addEventListener("keydown",function(e){if(e.key==="Enter"||e.key===" "){e.preventDefault();openModal(it);}});
   fbBind(row.querySelector(".lp"),it.note,!!img);
+  fillMetaLine(row.querySelector(".meta-line"),it.note);
   var lf=row.querySelector(".lfav");
   if(lf){lf.classList.toggle("on",!!favMap[it.url]);lf.addEventListener("click",function(e){e.stopPropagation();toggleFav(it,lf);});}
   return row;
@@ -1497,7 +1560,12 @@ function renderGrouped(container,rows){
 /* ================= 渲染 ================= */
 function renderResults(){
   var box=document.getElementById("results");
-  var rows=applyQuality(state.byType[state.currentType]||[]);
+  var rawAll=state.byType[state.currentType]||[];
+  var rows=applyQuality(rawAll);
+  /* 筛选时标题显示「筛后 M 条（共 N 条）」，未筛选显示该网盘总数 */
+  var rtEl=document.getElementById("rTotal"),tailEl=document.getElementById("rTotalTail");
+  if(rtEl)rtEl.textContent=state.quality==="all"?rawAll.length:rows.length;
+  if(tailEl)tailEl.textContent=state.quality==="all"?" 条资源":" 条（共 "+rawAll.length+" 条）";
   box.innerHTML="";
   if(!rows.length){
     var empty=document.createElement("div");
@@ -1510,6 +1578,8 @@ function renderResults(){
   if(state.grouped){
     renderGrouped(container,rows);
     box.appendChild(container);
+    /* 与非聚合一致地预热豆瓣封面（含源海报可能失败、磁力按片名匹配的情形） */
+    fbPrefetch(rows.map(function(r){return r.note;}));
     revealBatch(box.querySelectorAll(".grp, .card, .lrow"),{dur:420,step:20,max:14});
   }else{
     rows.forEach(function(it){container.appendChild(buildResultItem(it,state.view));});
@@ -1526,6 +1596,7 @@ function showSkeleton(){
   document.getElementById("errorState").classList.add("hidden");
   document.getElementById("resultSection").classList.remove("hidden");
   document.getElementById("rTotal").textContent="…";
+  var rts=document.getElementById("rTotalTail");if(rts)rts.textContent=" 条资源";
   document.getElementById("rTime").textContent="";
   var box=document.getElementById("results");box.innerHTML="";
   if(state.view==="list"){
@@ -1582,10 +1653,14 @@ function openModal(it){
   state.currentItem=it;
   var img=it.images[0]||"";
   var poster=document.getElementById("mPoster");
-  poster.innerHTML='<div class="ph"><svg viewBox="0 0 24 24" width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 4v16M17 4v16M3 9h4M3 15h4M17 9h4M17 15h4"/></svg></div>'+(img?'<img src="'+esc(img)+'" referrerpolicy="no-referrer" onerror="retryImg(this)">':'');
+  /* 有源海报直接给图；无图先显加载态（而非静态占位字），补全到达即替换 */
+  poster.innerHTML=(img?phFilm():'')+(img?'<img src="'+esc(img)+'" referrerpolicy="no-referrer" onerror="retryImg(this)">':phLoading());
   fbBind(poster,it.note,!!img);
   document.getElementById("mDrive").textContent=driveLabel(it.drive);
   document.getElementById("mTitle").textContent=it.note||"未命名资源";
+  var mMeta=document.getElementById("mMeta");
+  mMeta.dataset.metaNote=it.note||"";
+  fillMetaLine(mMeta,it.note);
   document.getElementById("mSource").textContent=prettySource(it.source)||"—";
   document.getElementById("mDate").textContent=fmtDate(it.datetime);
   var tags=document.getElementById("mTags");tags.innerHTML="";
@@ -1603,6 +1678,8 @@ function openModal(it){
   }
   document.getElementById("mOpen").href=safeUrl(it.url);
   syncModalFav(it);
+  syncModalWatch();
+  ensureWatchLoaded().then(syncModalWatch);
   modalBack.classList.add("show");
   document.body.style.overflow="hidden";
   /* 焦点管理：记录打开前的焦点，将焦点移入弹窗（焦点陷阱） */
@@ -1678,6 +1755,55 @@ document.getElementById("mFav").addEventListener("click",function(){
   if(state.currentItem)toggleFav(state.currentItem,null);
 });
 
+/* ================= 详情弹窗追剧三态（复用 /portal/api/watch，键为当前搜索剧名） ================= */
+var watchLoaded=false;
+function modalWatchKeyword(){var el=document.getElementById("searchInput");return el?el.value.trim():"";}
+function refreshWatch(){
+  return api("/portal/api/watch").then(function(r){if(!r.ok)throw new Error();return r.json();})
+    .then(function(res){watchItems=res.items||[];watchLoaded=true;})
+    .catch(function(){throw new Error("watch load fail");});
+}
+function ensureWatchLoaded(){
+  if(watchLoaded)return Promise.resolve();
+  return refreshWatch().catch(function(){watchLoaded=false;});
+}
+function findWatch(kw){return watchItems.find(function(z){return z.keyword===kw;});}
+function syncModalWatch(){
+  var kw=modalWatchKeyword(),b=document.getElementById("mWatch"),t=document.getElementById("mWatchTxt");
+  if(!b||!t)return;
+  var w=kw?findWatch(kw):null,st=w?(w.status||"watching"):"";
+  b.classList.toggle("on",!!st);
+  t.textContent=st?WATCH_STATUS_LABEL[st]:"追剧";
+}
+function modalCycleWatch(){
+  var kw=modalWatchKeyword();
+  if(!kw){toast("warn","缺少剧名，无法追剧");return;}
+  var w=findWatch(kw),cur=w?(w.status||"watching"):"";
+  if(cur==="watched"){
+    /* 末态再点：取消订阅。POST 不回 id，必要时先重拉列表取 id */
+    var doDelete=function(target){
+      if(!target||!target.id){toast("warn","操作失败，请稍后重试");return;}
+      api("/portal/api/watch/"+target.id,{method:"DELETE"}).then(function(r){
+        if(!r.ok)throw new Error();
+        watchItems=watchItems.filter(function(z){return z.id!==target.id;});
+        toast("ok","已取消追剧");syncModalWatch();
+      }).catch(function(){toast("warn","操作失败，请稍后重试");});
+    };
+    if(w&&w.id)doDelete(w);else refreshWatch().then(function(){doDelete(findWatch(kw));}).catch(function(){toast("warn","操作失败，请稍后重试");});
+    return;
+  }
+  var next=cur?WATCH_STATUS_ORDER[WATCH_STATUS_ORDER.indexOf(cur)+1]:"want";
+  api("/portal/api/watch",{method:"POST",body:JSON.stringify({keyword:kw,status:next})})
+    .then(function(r){return r.json().then(function(j){return{ok:r.ok,j:j};});})
+    .then(function(x){
+      if(!x.ok){toast("warn",(x.j&&x.j.detail)||"更新失败");return;}
+      var ex=findWatch(kw);
+      if(ex)ex.status=next;else watchItems.push({keyword:kw,status:next});
+      toast("ok","已标记为「"+WATCH_STATUS_LABEL[next]+"」");syncModalWatch();
+    }).catch(function(){toast("warn","更新失败，请稍后重试");});
+}
+document.getElementById("mWatch").addEventListener("click",modalCycleWatch);
+
 /* ================= 个人面板 ================= */
 var panelBack=document.getElementById("panelBack"),panelBody=document.getElementById("panelBody");
 function relTime(ts){
@@ -1731,7 +1857,7 @@ function renderObs(m){
     m.source_health.forEach(function(r){
       h+='<div class="admin-row"><span class="u">'+esc(r.source||"未知")+'</span>'+
         '<span class="s">存活 '+r.alive+' · 失效 '+r.dead+'</span>'+
-        '<span class="la">'+relTime(r.updated)+'</span></div>';
+        '<span class="la">'+relTime(r.updated_text||r.updated)+'</span></div>';
     });
   }
   var sec=m.security||{},mc=m.mcp||{},wt=m.watch||{},wbs=wt.by_status||{};
@@ -1897,11 +2023,23 @@ function renderWatch(){
   panelBody.innerHTML='<div class="panel-empty"><h4>加载中…</h4></div>';
   api("/portal/api/watch").then(function(r){if(!r.ok)throw new Error();return r.json();}).then(function(res){
     watchItems=res.items||[];
+    watchLoaded=true;
     var html='<div class="watch-add">'+
       '<input id="watchInput" type="text" placeholder="想追的剧名，如 庆余年 / 繁花 第二季" maxlength="40" autocomplete="off">'+
       '<button id="watchAddBtn" class="btn-primary">订阅</button></div>'+
       '<p class="watch-tip">新订阅默认「在看」，系统每 2 小时检查一次，发现新片源或更高画质通过 Bark 推送；只有「在看」接收推送，「想看 / 看过」只做收藏不打扰。</p>'+
-      '<div class="rss-actions" style="margin:2px 2px 4px"><button id="rssBtn" class="btn-ghost">获取 RSS 订阅链接</button></div><div id="rssMount"></div>';
+      '<div class="rss-actions" style="margin:2px 2px 4px"><button id="rssBtn" class="btn-ghost">获取 RSS 订阅链接</button></div><div id="rssMount"></div>'+
+      '<div class="bark-box">'+
+        '<div class="fav-group-title">Bark 手机推送</div>'+
+        '<p class="watch-tip" id="barkStatus">加载中…</p>'+
+        '<input id="barkServer" type="text" maxlength="200" placeholder="Bark 服务器，留空使用官方 https://api.day.app" autocomplete="off">'+
+        '<input id="barkKey" type="text" maxlength="120" placeholder="Bark 密钥；已保存后留空表示不修改" autocomplete="off">'+
+        '<div class="rss-actions">'+
+          '<button id="barkSave" class="btn-primary">保存配置</button>'+
+          '<button id="barkTest" class="btn-ghost">发送测试推送</button>'+
+          '<button id="barkClear" class="btn-ghost">清除自定义</button>'+
+        '</div>'+
+      '</div>';
     if(!watchItems.length){
       html+='<div class="panel-empty"><div class="pe-ic"><svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg></div><h4>还没有追剧</h4><p>订阅一部在更的剧，新资源出来自动提醒，不用反复手动搜</p></div>';
     }else{
@@ -1938,6 +2076,13 @@ function renderWatch(){
     addBtn.addEventListener("click",addWatch);
     document.getElementById("watchInput").addEventListener("keydown",function(e){if(e.key==="Enter")addWatch();});
     document.getElementById("rssBtn").addEventListener("click",loadRss);
+    var bSave=document.getElementById("barkSave");
+    if(bSave){
+      loadBarkConfig();
+      bSave.addEventListener("click",saveBarkConfig);
+      document.getElementById("barkTest").addEventListener("click",sendBarkTest);
+      document.getElementById("barkClear").addEventListener("click",clearBarkConfig);
+    }
     panelBody.querySelectorAll('[data-f]').forEach(function(b){b.addEventListener("click",function(){state.watchFilter=b.dataset.f;renderWatch();});});
     panelBody.querySelectorAll('[data-act="wdel"]').forEach(function(b){b.addEventListener("click",function(){delWatch(b.dataset.id);});});
     panelBody.querySelectorAll('[data-act="wsearch"]').forEach(function(b){b.addEventListener("click",function(){research(b.dataset.kw);});});
@@ -1964,6 +2109,60 @@ function delWatch(id){
   api("/portal/api/watch/"+id,{method:"DELETE"}).then(function(r){
     if(r.ok){toast("ok","已取消订阅");renderWatch();}else{toast("warn","操作失败");}
   }).catch(function(){toast("warn","操作失败");});
+}
+
+/* ---------------- 用户级 Bark 配置（未配置自定义时后端沿用站长默认通道） ---------------- */
+function paintBarkStatus(c){
+  var st=document.getElementById("barkStatus");if(!st)return;
+  if(c.configured){
+    st.textContent="已使用自定义通道，密钥 "+(c.key_hint||"****");
+  }else if(c.has_default){
+    st.textContent="未配置自定义，当前沿用站长默认通道";
+  }else{
+    st.textContent="尚未配置 Bark，填写服务器与密钥后即可接收手机推送";
+  }
+  var sv=document.getElementById("barkServer");
+  if(sv&&!sv.value)sv.placeholder=(c.server||"https://api.day.app")+"（留空即用）";
+}
+function loadBarkConfig(){
+  api("/portal/api/bark/config").then(function(r){if(!r.ok)throw new Error();return r.json();})
+    .then(paintBarkStatus)
+    .catch(function(){var st=document.getElementById("barkStatus");if(st)st.textContent="配置加载失败，请稍后重试";});
+}
+function saveBarkConfig(){
+  var server=document.getElementById("barkServer").value.trim();
+  var key=document.getElementById("barkKey").value.trim();
+  var body={};if(server)body.server=server;if(key)body.key=key;
+  var btn=document.getElementById("barkSave");btn.disabled=true;
+  api("/portal/api/bark/config",{method:"POST",body:JSON.stringify(body)})
+    .then(function(r){return r.json().then(function(j){return{ok:r.ok,j:j};});})
+    .then(function(x){
+      if(!x.ok){toast("warn",(x.j&&x.j.detail)||"保存失败");return;}
+      document.getElementById("barkKey").value="";
+      paintBarkStatus(x.j);toast("ok","Bark 配置已保存");
+    }).catch(function(){toast("warn","保存失败，请稍后重试");})
+    .finally(function(){btn.disabled=false;});
+}
+function sendBarkTest(){
+  var btn=document.getElementById("barkTest");btn.disabled=true;btn.textContent="发送中…";
+  api("/portal/api/bark/test",{method:"POST",body:"{}"})
+    .then(function(r){return r.json().then(function(j){return{ok:r.ok,j:j};});})
+    .then(function(x){
+      if(!x.ok){toast("warn",(x.j&&x.j.detail)||"推送失败");return;}
+      toast("ok",x.j&&x.j.channel==="user"?"测试推送已发往你的自定义通道":"测试推送已发往站长默认通道");
+    }).catch(function(){toast("warn","推送失败，请检查配置");})
+    .finally(function(){btn.disabled=false;btn.textContent="发送测试推送";});
+}
+function clearBarkConfig(){
+  var btn=document.getElementById("barkClear");btn.disabled=true;
+  api("/portal/api/bark/config",{method:"POST",body:JSON.stringify({clear:true})})
+    .then(function(r){return r.json().then(function(j){return{ok:r.ok,j:j};});})
+    .then(function(x){
+      if(!x.ok){toast("warn","清除失败");return;}
+      document.getElementById("barkServer").value="";document.getElementById("barkKey").value="";
+      paintBarkStatus(x.j);toast("ok","已清除自定义，回退默认通道");
+    }).catch(function(){toast("warn","清除失败，请稍后重试");})
+    .finally(function(){btn.disabled=false;});
 }
 var HINT_STYLE="color:#9a9384;font-size:13px;line-height:1.6;margin:6px 2px 4px";
 function renderAdmin(){

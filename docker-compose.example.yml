@@ -105,7 +105,7 @@ services:
       - BACKUP_KEEP=7
       - BACKUP_INTERVAL_SEC=86400
       # 版本号（后台可观测面板/健康探针展示）
-      - APP_VERSION=0.4.0
+      - APP_VERSION=0.5.0
       # 上游熔断：连续失败 N 次打开，冷却 M 秒后半开试探；熔断期优先本地 FTS 兜底
       - CB_FAIL_THRESHOLD=5
       - CB_OPEN_SEC=30
