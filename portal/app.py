@@ -44,7 +44,7 @@ logger = logging.getLogger("portal")
 UPSTREAM = os.environ.get("PANSOU_UPSTREAM", "http://pansou").rstrip("/")
 DB_PATH = os.environ.get("DB_PATH", "/app/data/portal.db")
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
-APP_VERSION = os.environ.get("APP_VERSION", "0.2.0")
+APP_VERSION = os.environ.get("APP_VERSION", "0.3.0")
 
 # SQLite 在线备份：启动一份 + 每日轮转，Connection.backup() 在 WAL 下也保证一致性
 BACKUP_ENABLED = bool(int(os.environ.get("BACKUP_ENABLED", "1")))
@@ -109,11 +109,20 @@ SOURCE_HEALTH_FLOOR = float(os.environ.get("SOURCE_HEALTH_FLOOR", "0.5"))
 # 查询改写 / 多路召回（方案一）：主词结果偏少或为 0 时，并发等价变体与
 # 逐级退化词回源，合并后复用同一套去重/死链净化，只在供给不足时触发以控开销。
 QUERY_REWRITE_ENABLED = bool(int(os.environ.get("QUERY_REWRITE_ENABLED", "1")))
-QUERY_VARIANT_MAX = int(os.environ.get("QUERY_VARIANT_MAX", "3"))
+# 变体上限：季等价 + 同义词（繁简/别号/中英译名）+ 逐级退化共享，强等价优先于退化
+QUERY_VARIANT_MAX = int(os.environ.get("QUERY_VARIANT_MAX", "5"))
 # 主词去重后唯一链接数低于该值才触发变体召回
 QUERY_REWRITE_MIN_HITS = int(os.environ.get("QUERY_REWRITE_MIN_HITS", "8"))
 # 变体回源整体等待硬顶（秒），超时只收已完成的部分，绝不拖垮主响应
 QUERY_VARIANT_TIMEOUT = float(os.environ.get("QUERY_VARIANT_TIMEOUT", "8"))
+# 同义词召回（繁简体 + 作品别号/中英译名），纯规则词典、零外部依赖，可独立关闭
+SYNONYM_ENABLED = bool(int(os.environ.get("SYNONYM_ENABLED", "1")))
+# 每个裸片名最多取几个别号变体，防止大别名组爆量
+SYNONYM_ALIAS_MAX = int(os.environ.get("SYNONYM_ALIAS_MAX", "2"))
+
+# 远程 MCP（Streamable HTTP，JSON-RPC 2.0）：把搜索薄封装暴露给 AI 客户端，Bearer JWT 鉴权
+MCP_ENABLED = bool(int(os.environ.get("MCP_ENABLED", "1")))
+MCP_RESULT_LIMIT = int(os.environ.get("MCP_RESULT_LIMIT", "30"))
 
 # 海报图片代理：海报多为 Telegram CDN（telesco.pe，国内直连被墙），
 # 由 portal 经 HTTP 代理回源后转发，浏览器只走同源，不直连图床。
@@ -1422,6 +1431,124 @@ def _root_core(keyword: str) -> str:
     return _norm_space(head)
 
 
+# ---------------- 同义词召回（#233，纯规则、零外部依赖） ----------------
+# 高频简体→繁体单字表（影视片名/资源标题常用字，一对多歧义取最通用繁体）。
+# 仅用于多召回一路变体；表外字原样保留，转不出差异就不产生繁体变体，安全降级。
+_S2T_MAP = {
+    "个": "個", "们": "們", "这": "這", "里": "裡", "后": "後", "为": "為",
+    "于": "於", "么": "麼", "无": "無", "来": "來", "时": "時", "间": "間",
+    "对": "對", "过": "過", "还": "還", "关": "關", "开": "開", "观": "觀",
+    "见": "見", "听": "聽", "说": "說", "话": "話", "语": "語", "请": "請",
+    "问": "問", "电": "電", "视": "視", "剧": "劇", "综": "綜", "艺": "藝",
+    "纪": "紀", "录": "錄", "节": "節", "国": "國", "乡": "鄉", "边": "邊",
+    "际": "際", "云": "雲", "风": "風", "雾": "霧", "爱": "愛", "怀": "懷",
+    "欢": "歡", "乐": "樂", "声": "聲", "梦": "夢", "华": "華", "丽": "麗",
+    "坚": "堅", "强": "強", "伟": "偉", "学": "學", "庆": "慶", "余": "餘",
+    "丰": "豐", "现": "現", "发": "發", "游": "遊", "戏": "戲", "战": "戰",
+    "争": "爭", "斗": "鬥", "阴": "陰", "阳": "陽", "险": "險", "红": "紅",
+    "绿": "綠", "蓝": "藍", "黄": "黃", "银": "銀", "铜": "銅", "铁": "鐵",
+    "钱": "錢", "饭": "飯", "汤": "湯", "妈": "媽", "儿": "兒", "孙": "孫",
+    "师": "師", "医": "醫", "护": "護", "贼": "賊", "兴": "興", "伤": "傷",
+    "难": "難", "优": "優", "胜": "勝", "败": "敗", "进": "進", "达": "達",
+    "运": "運", "动": "動", "远": "遠", "长": "長", "浅": "淺", "旧": "舊",
+    "坏": "壞", "实": "實", "虚": "虛", "异": "異", "别": "別", "称": "稱",
+    "号": "號", "寻": "尋", "获": "獲", "给": "給", "网": "網", "盘": "盤",
+    "链": "鏈", "资": "資", "讯": "訊", "线": "線", "点": "點", "络": "絡",
+    "数": "數", "据": "據", "体": "體", "会": "會", "议": "議", "团": "團",
+    "队": "隊", "组": "組", "员": "員", "业": "業", "厂": "廠", "场": "場",
+    "铺": "鋪", "经": "經", "济": "濟", "价": "價", "币": "幣", "万": "萬",
+    "亿": "億", "块": "塊", "计": "計", "划": "劃", "帮": "幫", "协": "協",
+    "题": "題", "头": "頭", "脑": "腦", "脸": "臉", "脚": "腳", "裤": "褲",
+    "楼": "樓", "桥": "橋", "岛": "島", "叶": "葉", "树": "樹", "鸟": "鳥",
+    "兽": "獸", "鱼": "魚", "虫": "蟲", "热": "熱", "温": "溫", "干": "乾",
+    "湿": "濕", "灯": "燈", "烟": "煙", "买": "買", "卖": "賣", "货": "貨",
+    "赚": "賺", "赔": "賠", "选": "選", "择": "擇", "决": "決", "愿": "願",
+    "记": "記", "忆": "憶", "惊": "驚", "讶": "訝", "极": "極", "敌": "敵",
+    "杀": "殺", "枪": "槍", "剑": "劍", "钥": "鑰", "灵": "靈", "圣": "聖",
+    "侠": "俠", "隐": "隱", "维": "維", "镇": "鎮", "县": "縣", "台": "臺",
+    "湾": "灣", "军": "軍", "谍": "諜", "悬": "懸", "侦": "偵", "闹": "鬧",
+    "灾": "災", "历": "歷", "怖": "怖", "卧": "臥", "传": "傳", "访": "訪",
+    "谈": "談", "画": "畫", "摄": "攝", "导": "導", "编": "編", "质": "質",
+    "轨": "軌", "双": "雙", "标": "標", "筛": "篩", "滤": "濾", "键": "鍵",
+    "词": "詞", "门": "門", "单": "單", "状": "狀", "态": "態", "补": "補",
+    "验": "驗", "删": "刪", "试": "試", "断": "斷", "级": "級", "备": "備",
+    "监": "監", "仪": "儀", "报": "報", "觉": "覺", "参": "參", "环": "環",
+    "变": "變", "权": "權", "账": "賬", "凭": "憑", "证": "證", "简": "簡",
+    "义": "義", "扩": "擴", "护": "護", "从": "從", "虽": "雖", "没": "沒",
+    "系": "係", "将": "將", "总": "總", "尔": "爾", "钟": "鐘", "类": "類",
+    "响": "響", "顾": "顧",
+}
+
+# 作品别号/中英译名：同一作品的等价裸片名（不含季号/年份/副标题），只收高确定性条目。
+# 组内任意写法互为别名；匹配按小写精确相等，避免子串误伤。可按需自行增补。
+_TITLE_ALIAS_GROUPS = [
+    ["盗梦空间", "Inception"],
+    ["肖申克的救赎", "刺激1995", "The Shawshank Redemption"],
+    ["这个杀手不太冷", "杀手里昂", "Léon: The Professional", "Leon"],
+    ["星际穿越", "Interstellar"],
+    ["阿凡达", "Avatar"],
+    ["沙丘", "Dune"],
+    ["奥本海默", "Oppenheimer"],
+    ["流浪地球", "The Wandering Earth"],
+    ["鱿鱼游戏", "Squid Game"],
+    ["复仇者联盟", "复联", "Avengers"],
+    ["哈利波特", "哈利·波特", "Harry Potter"],
+    ["指环王", "魔戒", "The Lord of the Rings"],
+    ["黑客帝国", "骇客任务", "The Matrix"],
+    ["速度与激情", "玩命关头", "Fast & Furious"],
+    ["生化危机", "恶灵古堡", "Resident Evil"],
+    ["加勒比海盗", "Pirates of the Caribbean"],
+    ["蝙蝠侠", "Batman"],
+    ["蜘蛛侠", "Spider-Man"],
+    ["星球大战", "星际大战", "Star Wars"],
+    ["冰雪奇缘", "Frozen"],
+    ["疯狂动物城", "Zootopia"],
+]
+_ALIAS_INDEX = {}
+for _g in _TITLE_ALIAS_GROUPS:
+    _names = [n.strip() for n in _g if n.strip()]
+    for _n in _names:
+        _ALIAS_INDEX[_n.lower()] = [x for x in _names if x != _n]
+
+
+def _s2t(s: str) -> str:
+    """简体→繁体（内联高频单字表）；表外字原样保留，仅供多一路召回。"""
+    if not s:
+        return ""
+    return "".join(_S2T_MAP.get(ch, ch) for ch in s)
+
+
+def _alias_names(root: str):
+    """裸根片名命中别名词典时返回同作品其他写法（保留原大小写），否则空列表。"""
+    if not root:
+        return []
+    return list(_ALIAS_INDEX.get(root.strip().lower(), []))
+
+
+def _equivalent_roots(keyword: str):
+    """变体相关性过滤用的等价根词集合（小写）：原根 + 繁体根 + 别号根。
+    纯字母根去空格短于 3 不收，防止单/双字母英文子串误命中；中文根不受此限。"""
+    root = _root_core(keyword)
+    roots = set()
+
+    def keep(r):
+        r = (r or "").strip()
+        if not r:
+            return
+        low = r.lower()
+        compact = re.sub(r"\s+", "", low)
+        if re.fullmatch(r"[a-z0-9.&':\-]+", compact) and len(compact) < 3:
+            return
+        roots.add(low)
+
+    keep(root)
+    if SYNONYM_ENABLED:
+        keep(_s2t(root))
+        for _a in _alias_names(root):
+            keep(_root_core(_a))
+    return roots
+
+
 def _query_variants(keyword: str, limit: int):
     """生成有序、去重、不含原词的召回变体：先季等价，再长查询逐级退化。"""
     kw = _norm_space(keyword)
@@ -1451,6 +1578,34 @@ def _query_variants(keyword: str, limit: int):
                 add(f"{b} 第{_num_to_cn(n)}季")
                 add(f"{b} 第{n}季")
                 add(f"{b} S{n}")
+
+    # 同义词（强等价，优先于后面的逐级退化）：繁简体 + 作品别号/中英译名。
+    # 仅对「裸根名（可带季/年/类型词）、无实义副标题」生效：既避免给长尾查询造
+    # 等长繁体变体挤占退化名额，也防止别号带着副标题泛化串片。
+    if SYNONYM_ENABLED:
+        sbase, sseason = _parse_season(kw)
+        extra = []
+        for t in [t for t in re.split(r"[\s,，、]+", kw) if t][1:]:
+            if _YEAR_RE.fullmatch(t):
+                continue
+            if _SEASON_RE.search(t) or _SEASON_EN_RE.search(t):
+                continue
+            if t in _TYPE_WORDS:
+                continue
+            extra.append(t)
+        if not extra and sbase:
+            tw = _s2t(sbase)
+            if tw and tw != sbase:
+                suffix = (" 第%d季" % sseason) if sseason is not None else ""
+                add(tw + suffix)
+            for al in _alias_names(_root_core(kw))[:SYNONYM_ALIAS_MAX]:
+                al_root = _root_core(al)
+                if sseason is not None and re.search(r"[A-Za-z]", al_root):
+                    add("%s S%d" % (al_root, sseason))
+                elif sseason is not None:
+                    add("%s 第%d季" % (al_root, sseason))
+                else:
+                    add(al_root)
 
     # 长查询逐级退化：从尾部逐档去限定词直到首段根片名；遇到季 token 立即停止防串季
     tokens = [t for t in re.split(r"[\s,，、]+", kw) if t]
@@ -1495,12 +1650,15 @@ def _root_hits(root: str, low: str) -> bool:
 
 
 def _variant_relevant(orig_kw: str, item: dict) -> bool:
-    """变体『新增』结果相关性把关：根片名必须命中；明确异季/年代冲突则剔除。"""
+    """变体『新增』结果相关性把关：原根或其等价写法（繁简/别号/中英译名）须干净命中；
+    明确异季/年代冲突则剔除。"""
     note = item.get("note") or ""
     low = note.lower()
     root = _root_core(orig_kw)
-    if len(root) >= 2 and not _root_hits(root, low):
-        return False
+    if len(root) >= 2:
+        roots = _equivalent_roots(orig_kw)
+        if not any(_root_hits(r, low) for r in roots):
+            return False
     _, season = _parse_season(orig_kw)
     ts = _title_season(note)
     if season is not None and ts is not None and ts != season:
@@ -1825,6 +1983,7 @@ async def health():
     return {"ok": True, "service": "pansou-portal", "mode": "longtoken",
             "version": APP_VERSION,
             "circuit": cb.snapshot()["state"],
+            "mcp": MCP_ENABLED,
             "upstream": UPSTREAM}
 
 
@@ -3004,6 +3163,160 @@ async def del_watch(wid: int, request: Request):
     with db() as conn:
         conn.execute("DELETE FROM watch WHERE id=? AND username=?", (wid, u))
     return {"ok": True}
+
+
+# ---------------- 远程 MCP（Streamable HTTP / JSON-RPC 2.0，#232） ----------------
+# 不引第三方 MCP SDK，单文件手写最小协议面，把内部搜索薄封装暴露给支持 Streamable
+# HTTP 的 AI 客户端（Claude Desktop / Cursor 等）；POST 单 JSON 响应，Bearer JWT 鉴权。
+MCP_PROTOCOL_VERSION = "2025-03-26"
+_MCP_JSONRPC = "2.0"
+
+
+def _jsonrpc_error(req_id, code: int, message: str):
+    return {"jsonrpc": _MCP_JSONRPC, "id": req_id,
+            "error": {"code": code, "message": message}}
+
+
+def _shape_mcp_results(mbt: dict, limit: int):
+    """merged_by_type 展平为 AI 客户端易读的精简列表，跳过空链接并按上限截断。"""
+    rows, n = [], 0
+    for drive, items in (mbt or {}).items():
+        for it in items:
+            if n >= limit:
+                return rows
+            url = (it.get("url") or "").strip()
+            if not url:
+                continue
+            rows.append({
+                "title": it.get("note") or "",
+                "drive": drive,
+                "url": url,
+                "password": it.get("password") or "",
+                "source": it.get("source") or "",
+                "datetime": it.get("datetime") or "",
+            })
+            n += 1
+    return rows
+
+
+_MCP_TOOLS = [{
+    "name": "search_resources",
+    "description": (
+        "搜索全网网盘影视资源（电影/电视剧/动漫/纪录片/综艺），按网盘类型返回资源标题、"
+        "可直接打开的分享链接与提取码，不登录网盘、不做转存。keyword 为影视名，"
+        "可带画质要求，如『沙丘2 4K原盘』；limit 可选，控制返回条数。"),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "keyword": {"type": "string", "description": "影视名称或资源关键词"},
+            "limit": {"type": "integer", "minimum": 1,
+                      "maximum": MCP_RESULT_LIMIT, "default": MCP_RESULT_LIMIT},
+        },
+        "required": ["keyword"],
+    },
+}]
+
+
+async def _mcp_handle(payload):
+    """处理单个 JSON-RPC 消息，返回 (http_status, body|None)；
+    通知（无 id）无需响应时 body 为 None，由路由回 204。"""
+    if not isinstance(payload, dict) or payload.get("jsonrpc") != _MCP_JSONRPC:
+        return 400, _jsonrpc_error(
+            payload.get("id") if isinstance(payload, dict) else None,
+            -32600, "无效的 JSON-RPC 请求")
+    req_id = payload.get("id")
+    method = payload.get("method")
+    params = payload.get("params") or {}
+    is_notification = "id" not in payload
+
+    if method == "initialize":
+        return 200, {"jsonrpc": _MCP_JSONRPC, "id": req_id, "result": {
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "miying-pansou-portal",
+                           "version": APP_VERSION}}}
+    if method == "ping":
+        return 200, {"jsonrpc": _MCP_JSONRPC, "id": req_id, "result": {}}
+    if is_notification:
+        # notifications/initialized 等通知：确认收下即可，不回 JSON-RPC 体
+        return 204, None
+    if method == "tools/list":
+        return 200, {"jsonrpc": _MCP_JSONRPC, "id": req_id,
+                     "result": {"tools": _MCP_TOOLS}}
+    if method == "tools/call":
+        if not isinstance(params, dict):
+            return 200, _jsonrpc_error(req_id, -32602, "params 必须是对象")
+        if params.get("name") != "search_resources":
+            return 200, _jsonrpc_error(req_id, -32602,
+                                       "未知工具: %s" % params.get("name"))
+        args = params.get("arguments") or {}
+        if not isinstance(args, dict):
+            return 200, _jsonrpc_error(req_id, -32602, "arguments 必须是对象")
+        keyword = (args.get("keyword") or "").strip()
+        if not keyword:
+            return 200, _jsonrpc_error(req_id, -32602,
+                                       "参数 keyword 不能为空")
+        try:
+            limit = int(args.get("limit", MCP_RESULT_LIMIT))
+        except (TypeError, ValueError):
+            limit = MCP_RESULT_LIMIT
+        limit = max(1, min(limit, MCP_RESULT_LIMIT))
+        try:
+            async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(60.0, connect=15.0)) as client:
+                mbt = await _internal_search(keyword, client)
+            rows = _shape_mcp_results(mbt, limit)
+            result = {
+                "content": [{"type": "text", "text": json.dumps(
+                    {"keyword": keyword, "count": len(rows), "results": rows},
+                    ensure_ascii=False)}],
+                "isError": False}
+        except Exception as e:
+            logger.warning("mcp search failed kw=%s: %s", keyword, e)
+            result = {"content": [{"type": "text",
+                                   "text": "搜索失败，请稍后重试"}],
+                      "isError": True}
+        return 200, {"jsonrpc": _MCP_JSONRPC, "id": req_id, "result": result}
+    return 200, _jsonrpc_error(req_id, -32601,
+                               "方法不支持: %s" % method)
+
+
+@app.api_route("/portal/mcp", methods=["POST"])
+async def mcp_entry(request: Request):
+    if not MCP_ENABLED:
+        return JSONResponse({"detail": "MCP 未启用"}, status_code=404)
+    require_user(request)  # 未授权直接由全局 _AuthError 处理器回 401
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(
+            _jsonrpc_error(None, -32600, "请求体不是合法 JSON"), status_code=400)
+    if isinstance(payload, list):  # JSON-RPC 批处理（可选能力）
+        if not payload:
+            return JSONResponse(
+                _jsonrpc_error(None, -32600, "空批处理请求"), status_code=400)
+        out = []
+        for piece in payload:
+            _, body = await _mcp_handle(piece)
+            if body is not None:
+                out.append(body)
+        if not out:
+            return Response(status_code=204)
+        return JSONResponse(out, status_code=200)
+    status, body = await _mcp_handle(payload)
+    if body is None:
+        return Response(status_code=status)
+    return JSONResponse(body, status_code=status)
+
+
+@app.api_route("/portal/mcp", methods=["GET"])
+async def mcp_get_entry(request: Request):
+    # Streamable HTTP 允许服务器只提供 POST 单响应、不提供 GET SSE 长流
+    if not MCP_ENABLED:
+        return JSONResponse({"detail": "MCP 未启用"}, status_code=404)
+    return JSONResponse(
+        {"detail": "本端点仅支持 POST JSON-RPC，请用 MCP 客户端以 POST 接入"},
+        status_code=405)
 
 
 async def check_watches():

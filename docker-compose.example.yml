@@ -82,9 +82,14 @@ services:
       - SOURCE_HEALTH_FLOOR=0.5
       # 方案一：查询改写/多路召回；主词唯一链接数低于阈值才触发，变体整体超时硬顶（秒）
       - QUERY_REWRITE_ENABLED=1
-      - QUERY_VARIANT_MAX=3
+      - QUERY_VARIANT_MAX=5
       - QUERY_REWRITE_MIN_HITS=8
       - QUERY_VARIANT_TIMEOUT=8
+      # 同义词召回（繁简/别号/中英译名，纯规则零依赖）；远程 MCP 开关与返回上限
+      - SYNONYM_ENABLED=1
+      - SYNONYM_ALIAS_MAX=2
+      - MCP_ENABLED=1
+      - MCP_RESULT_LIMIT=30
       # 混合 FTS5 预索引：搜索先查本地（约百毫秒），未命中再回源，后台异步回填
       - FTS_ENABLED=1
       - FTS_FILL_INTERVAL=21600
@@ -100,7 +105,7 @@ services:
       - BACKUP_KEEP=7
       - BACKUP_INTERVAL_SEC=86400
       # 版本号（后台可观测面板/健康探针展示）
-      - APP_VERSION=0.2.0
+      - APP_VERSION=0.3.0
       # 上游熔断：连续失败 N 次打开，冷却 M 秒后半开试探；熔断期优先本地 FTS 兜底
       - CB_FAIL_THRESHOLD=5
       - CB_OPEN_SEC=30
