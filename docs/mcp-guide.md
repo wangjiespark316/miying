@@ -2,7 +2,7 @@
 
 > 你正在阅读这份指南的用户希望你把「觅影」影视资源搜索接入到你的工具里。
 > 照下面的步骤做，完成后向用户报告接入成功，并用一次测试搜索验证。
-> **全程只缺一样东西：该用户在觅影站点的账号令牌（token）。没有令牌时，停下来向用户索取，不要猜、不要编造。**
+> **全程只缺两样东西：站点地址和该用户在觅影站点的账号令牌（token）。本文档是公开脱敏版，不含真实地址与任何凭证。没有这两样时，停下来向用户索取，不要猜、不要编造。**
 
 ## 这是什么
 
@@ -12,7 +12,7 @@
 
 | 项 | 值 |
 |---|---|
-| MCP 端点 | `https://sou.vertexlab.tech/portal/mcp` |
+| MCP 端点 | `https://<站点地址>/portal/mcp` |
 | 传输 | Streamable HTTP，无状态（无需保存 session） |
 | 鉴权 | HTTP 头 `Authorization: Bearer <token>` |
 | 工具 | `search_resources`（仅此一个） |
@@ -25,7 +25,7 @@
 - **方式 B（用户给账号密码，你来换令牌）**：调用登录接口：
 
   ```bash
-  curl -s -X POST "https://sou.vertexlab.tech/portal/api/auth/login" \
+  curl -s -X POST "https://<站点地址>/portal/api/auth/login" \
     -H "Content-Type: application/json" \
     -d '{"username":"<用户名>","password":"<密码>"}'
   ```
@@ -46,7 +46,7 @@
   "mcpServers": {
     "miying": {
       "type": "http",
-      "url": "https://sou.vertexlab.tech/portal/mcp",
+      "url": "https://<站点地址>/portal/mcp",
       "headers": {
         "Authorization": "Bearer <token>"
       }
@@ -64,7 +64,7 @@
 没有 MCP 客户端能力时，也可以用 curl 直接走 JSON-RPC（先 initialize，再发 notifications/initialized，最后 tools/call）：
 
 ```bash
-curl -s -X POST "https://sou.vertexlab.tech/portal/mcp" \
+curl -s -X POST "https://<站点地址>/portal/mcp" \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
