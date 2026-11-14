@@ -15,6 +15,7 @@ import base64
 import difflib
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -200,6 +201,9 @@ FTS_PER_DRIVE_FLOOR = int(os.environ.get("FTS_PER_DRIVE_FLOOR", "8"))        # �
 FTS_ART_TTL = int(os.environ.get("FTS_ART_TTL", str(45 * 86400)))            # 条目过期清理
 FTS_WORD_GAP = float(os.environ.get("FTS_WORD_GAP", "1.5"))                  # 词间间隔
 FTS_QUERY_LIMIT = int(os.environ.get("FTS_QUERY_LIMIT", "120"))              # 本地查询返回上限
+# FTS 缓存代际：选行/配额规则变更时 +1，启动即一次性作废旧快照，令各词下次搜索
+# miss 回源按新规则重建（仅清 FTS 三表，dead_links/source_health/history 不受影响）
+FTS_CACHE_GEN = 2
 # 热搜/热榜覆盖不到的固定常用词（热门 / 经典画质标杆，与 warm-cache 对齐）
 FTS_STATIC_WORDS = ["沙丘2", "阿凡达", "让子弹飞", "奥本海默", "流浪地球2",
                     "满江红", "封神第一部", "年会不能停", "热辣滚烫",
@@ -569,6 +573,24 @@ def verify_password(pwd: str, salt: str, expected: str) -> bool:
     return hmac.compare_digest(dk, expected)
 
 
+# ---------------- IP 网段归并（须前置于本模块顶层 init_db() 调用，供建表迁移回填） ----------------
+def _ip_net_key(ip: str) -> str:
+    """动态 IP 归并键：IPv4 取 /24、IPv6 取 /64；非法地址回退精确 IP（保守不并）。
+    同一最小路由广播块内的地址漂移必属同局向（同城同运营商），以此作为"新设备"
+    判定口径可消除家宽动态 IP 误报，且纯标准库计算、不引入 GeoIP 或外部查询。"""
+    if not ip:
+        return ""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip
+    prefix = "/24" if isinstance(addr, ipaddress.IPv4Address) else "/64"
+    try:
+        return str(ipaddress.ip_network(f"{ip}{prefix}", strict=False))
+    except ValueError:
+        return ip
+
+
 # ---------------- 数据库 ----------------
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -593,10 +615,21 @@ def init_db():
         db.execute("""CREATE TABLE IF NOT EXISTS alerts(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ip TEXT NOT NULL, reason TEXT, detail TEXT, ts TEXT NOT NULL)""")
-        # 登录来源 IP 登记：公网新 IP 首次成功登录推送一次 Bark，已知 IP 静默累计
+        # 登录来源 IP 登记：按网段归并（IPv4 /24、IPv6 /64）判定新设备，
+        # 动态 IP 在同一网段内漂移不重复报；具体 IP 仍逐行登记便于审计
         db.execute("""CREATE TABLE IF NOT EXISTS login_seen_ip(
-            ip TEXT PRIMARY KEY, first_ts TEXT NOT NULL,
+            ip TEXT PRIMARY KEY, net_key TEXT NOT NULL DEFAULT '',
+            first_ts TEXT NOT NULL,
             last_ts TEXT NOT NULL, hits INTEGER DEFAULT 1)""")
+        # 老库补 net_key 列并回填存量网段，避免升级后把已见网段误判为新设备
+        lip_cols = {r[1] for r in db.execute("PRAGMA table_info(login_seen_ip)")}
+        if "net_key" not in lip_cols:
+            db.execute(
+                "ALTER TABLE login_seen_ip ADD COLUMN net_key TEXT NOT NULL DEFAULT ''")
+        for r in db.execute(
+                "SELECT ip FROM login_seen_ip WHERE net_key=''").fetchall():
+            db.execute("UPDATE login_seen_ip SET net_key=? WHERE ip=?",
+                       (_ip_net_key(r[0]), r[0]))
         # RSS 订阅令牌：每用户一个不可猜测 token，阅读器经 query 令牌鉴权（无法带 Bearer）
         db.execute("""CREATE TABLE IF NOT EXISTS rss_feed(
             username TEXT PRIMARY KEY, token TEXT UNIQUE NOT NULL,
@@ -666,6 +699,9 @@ def init_db():
             n INTEGER DEFAULT 0,
             last_run REAL,
             src TEXT DEFAULT '')""")
+        # 通用键值元信息（如 FTS 缓存代际），承载一次性数据迁移闸门
+        db.execute("""CREATE TABLE IF NOT EXISTS app_meta(
+            key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '')""")
         # ---- A+B+C：死链持久化 + 来源健康度（平滑升级，旧库自动补建）----
         db.execute("""CREATE TABLE IF NOT EXISTS dead_links(
             url TEXT PRIMARY KEY,
@@ -682,6 +718,27 @@ def init_db():
             _dead_urls.add(r[0])
         for r in db.execute("SELECT source, alive, dead FROM source_health"):
             _src_health[r[0]] = [int(r[1] or 0), int(r[2] or 0)]
+        # FTS 缓存代际闸门：选行/配额规则升级后一次性作废旧截断快照，令每个词
+        # 下次搜索本地 miss 并按新规则回源重建；仅清 FTS 三表，死链库/健康度/历史
+        # 等保留；幂等，已处于当前代际则不再清空（重启不重复）。
+        grow = db.execute(
+            "SELECT value FROM app_meta WHERE key='fts_cache_gen'").fetchone()
+        try:
+            cur_gen = int(grow[0]) if grow and grow[0] not in (None, "") else 0
+        except (TypeError, ValueError):
+            cur_gen = 0
+        if cur_gen < FTS_CACHE_GEN:
+            dropped = db.execute("SELECT COUNT(*) FROM idx_arts").fetchone()[0]
+            db.execute("DELETE FROM idx_fts")
+            db.execute("DELETE FROM idx_arts")
+            db.execute("DELETE FROM idx_jobs")
+            db.execute(
+                "INSERT INTO app_meta(key,value) VALUES('fts_cache_gen',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(FTS_CACHE_GEN),))
+            logger.info(
+                "fts cache gen %s->%s: dropped %s cached arts; "
+                "rebuild on next search", cur_gen, FTS_CACHE_GEN, dropped)
     try:
         os.chmod(DB_PATH, 0o600)
     except OSError:
@@ -1431,29 +1488,49 @@ def _security_notify(ip: str, kind: str, title: str, detail: str):
         logger.warning("security notify failed: %s", e)
 
 
-def _note_login_seen_ip(username: str, ip: str):
-    """成功登录后登记来源 IP：公网新 IP 推送一次"新设备登录"，已知 IP 静默累计。"""
+def _note_login_seen_ip(username: str, ip: str, role: str):
+    """成功登录后登记来源 IP，按网段（IPv4 /24、IPv6 /64）判定是否新设备。
+
+    新网段：管理员即时 Bark 并落审计；普通账号只写审计 alerts 与日志、不推送，
+    管理面板仍可见。同网段内动态 IP 漂移视为已知，静默累计具体 IP，不重复报。"""
     if not LOGIN_IP_NOTIFY or _is_private_ip(ip):
         return
     try:
+        net = _ip_net_key(ip)
         with db() as conn:
+            net_seen = conn.execute(
+                "SELECT 1 FROM login_seen_ip WHERE net_key=? LIMIT 1",
+                (net,)).fetchone()
             row = conn.execute(
                 "SELECT hits FROM login_seen_ip WHERE ip=?", (ip,)).fetchone()
             if row is None:
                 conn.execute(
-                    "INSERT INTO login_seen_ip(ip,first_ts,last_ts,hits) "
-                    "VALUES(?,?,?,1)", (ip, now_ts(), now_ts()))
-                is_new = True
+                    "INSERT INTO login_seen_ip(ip,net_key,first_ts,last_ts,hits) "
+                    "VALUES(?,?,?,?,1)", (ip, net, now_ts(), now_ts()))
             else:
                 conn.execute(
-                    "UPDATE login_seen_ip SET last_ts=?, hits=? WHERE ip=?",
-                    (now_ts(), row["hits"] + 1, ip))
-                is_new = False
-        if is_new:
-            metrics.login_new_ip += 1
+                    "UPDATE login_seen_ip SET net_key=?,last_ts=?,hits=? WHERE ip=?",
+                    (net, now_ts(), row["hits"] + 1, ip))
+            is_new_net = net_seen is None
+        if not is_new_net:
+            return
+        metrics.login_new_ip += 1
+        if role == "admin":
             _security_notify(
                 ip, "login_new_ip", "觅影·新设备登录",
-                f"账号 {username} 自新 IP {ip} 登录成功，如非本人请立即改密")
+                f"管理员 {username} 自新网段 {net}（IP {ip}）登录成功，"
+                "如非本人请立即改密")
+            return
+        # 普通账号：仅审计 + 日志，不发 Bark；管理面板"最近滥用告警"可见
+        detail = (f"普通账号 {username} 自新网段 {net}（IP {ip}）登录成功，"
+                  "按分级策略仅记录、不推送")
+        logger.warning(
+            "login new net (user, no push) user=%s ip=%s net=%s",
+            username, ip, net)
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO alerts(ip,reason,detail,ts) VALUES(?,?,?,?)",
+                (ip, "login_new_ip", detail, now_ts()))
     except Exception as e:
         logger.warning("login seen ip failed: %s", e)
 
@@ -2884,7 +2961,7 @@ async def login(request: Request):
             and verify_password(p, row["salt"], row["pwd_hash"])):
         _login_fails.pop(ip, None)  # 登录成功，清除失败计数
         _login_locks.pop(ip, None)
-        _note_login_seen_ip(u, ip)  # 新公网 IP 首次登录 Bark 提醒
+        _note_login_seen_ip(u, ip, row["role"])  # 新网段登录：管理员推送/普通账号仅记录
         return {"token": make_token(u), "username": u,
                 "is_admin": row["role"] == "admin",
                 "ttl_days": TOKEN_TTL_DAYS}
