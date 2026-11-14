@@ -24,6 +24,8 @@
 - **方式 A（用户直接给令牌）**：用户把令牌发给你后，把它写入配置（见第二步），不要在对话里复述，不要写进任何公开文件或日志。
 - **方式 B（用户给账号密码，你来换令牌）**：调用登录接口：
 
+  **本步必须用命令行 / HTTP 请求完成，不要打开浏览器、不要模拟用户在网页上操作登录。**
+
   ```bash
   curl -s -X POST "https://sou.vertexlab.tech/portal/api/auth/login" \
     -H "Content-Type: application/json" \
