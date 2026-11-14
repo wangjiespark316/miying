@@ -16,6 +16,7 @@ import difflib
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -29,9 +30,25 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+# ---------------- 统一结构化日志（时间/级别/模块/消息，docker 直接采集）----------------
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S%z",
+    force=True,
+)
+logger = logging.getLogger("portal")
+
 UPSTREAM = os.environ.get("PANSOU_UPSTREAM", "http://pansou").rstrip("/")
 DB_PATH = os.environ.get("DB_PATH", "/app/data/portal.db")
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
+
+# SQLite 在线备份：启动一份 + 每日轮转，Connection.backup() 在 WAL 下也保证一致性
+BACKUP_ENABLED = bool(int(os.environ.get("BACKUP_ENABLED", "1")))
+BACKUP_DIR = os.environ.get("BACKUP_DIR", "/app/data/backups")
+BACKUP_KEEP = int(os.environ.get("BACKUP_KEEP", "7"))
+BACKUP_INTERVAL_SEC = int(os.environ.get("BACKUP_INTERVAL_SEC", "86400"))
 
 # 长效登录
 AUTH_USERS_RAW = os.environ.get("AUTH_USERS", "")
@@ -239,13 +256,13 @@ async def _fetch_magnets(kw: str, soft: bool = False) -> dict:
         items = []
         for r in (r1, r2):
             if isinstance(r, Exception):
-                print("[portal] magnet fetch error:", r)
+                logger.warning("magnet fetch error: %s", r)
             else:
                 items.extend(r)
         if items:
             result = {"magnet": items}
     except Exception as e:
-        print("[portal] magnet error:", e)
+        logger.warning("magnet error: %s", e)
     _MAGNET_CACHE[key] = (time.time() + MAGNET_CACHE_TTL, result)
     return result
 
@@ -447,6 +464,45 @@ def db():
         conn.commit()
     finally:
         conn.close()
+
+
+def backup_database(tag: str = "scheduled"):
+    """在线一致性备份主库并按份数轮转；同步 IO，仅在线程池内调用。"""
+    if not BACKUP_ENABLED:
+        return None
+    if not os.path.exists(DB_PATH):
+        logger.warning("backup skipped, db not found: %s", DB_PATH)
+        return None
+    try:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        stamp = time.strftime("%Y%m%d%H%M%S")
+        dest = os.path.join(BACKUP_DIR, "portal.db.%s-%s" % (tag, stamp))
+        # sqlite3 在线热备份：读取 WAL 最新一致视图，不阻塞正在进行的写入
+        with sqlite3.connect(DB_PATH) as src, sqlite3.connect(dest) as dst:
+            src.backup(dst)
+        os.chmod(dest, 0o600)
+        snaps = [os.path.join(BACKUP_DIR, n) for n in os.listdir(BACKUP_DIR)
+                 if n.startswith("portal.db.")]
+        snaps.sort(key=os.path.getmtime, reverse=True)
+        for old in snaps[BACKUP_KEEP:]:
+            os.remove(old)
+        logger.info("db backup ok tag=%s file=%s keep=%d", tag, dest, BACKUP_KEEP)
+        return dest
+    except Exception:
+        logger.exception("db backup failed tag=%s", tag)
+        return None
+
+
+async def backup_loop():
+    """启动先备份一份，之后每隔 BACKUP_INTERVAL_SEC 备份；失败不影响主服务。"""
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, backup_database, "startup")
+    while True:
+        await asyncio.sleep(BACKUP_INTERVAL_SEC)
+        try:
+            await loop.run_in_executor(None, backup_database, "daily")
+        except Exception:
+            logger.exception("backup loop error")
 
 
 def seed_users():
@@ -772,7 +828,7 @@ def _record_verdicts(verdict: dict, url_source: dict):
             except Exception:
                 pass
     except Exception as e:
-        print("[portal] record verdicts error:", e)
+        logger.warning("record verdicts error: %s", e)
 
 
 # ---------------- 链接失效检测 ----------------
@@ -854,7 +910,7 @@ async def _bg_deep_verify(keyword: str, mbt: dict):
         finally:
             _verify_inflight.difference_update(todo)
     except Exception as e:
-        print("[portal] bg deep verify error:", keyword, e)
+        logger.warning("bg deep verify error kw=%s: %s", keyword, e)
 
 
 # ---------------- 滥用检测 / 告警 ----------------
@@ -901,7 +957,7 @@ def maybe_alert(ip: str, reason: str):
             with httpx.Client(timeout=10.0) as c:
                 c.get(url)
         except Exception as e:
-            print("[portal] bark failed:", e)
+            logger.warning("bark failed: %s", e)
 
 
 def push_bark(title: str, body: str, group: str = "觅影", url: str = ""):
@@ -917,7 +973,7 @@ def push_bark(title: str, body: str, group: str = "觅影", url: str = ""):
         with httpx.Client(timeout=10.0) as c:
             c.get(q)
     except Exception as e:
-        print("[portal] push_bark failed:", e)
+        logger.warning("push_bark failed: %s", e)
 
 
 # ---------------- 透明代理（非搜索） ----------------
@@ -955,7 +1011,7 @@ async def _stream_proxy(request: Request, path: str):
                                  headers=resp_headers)
     except Exception as e:
         await client.aclose()
-        print("[portal] upstream error:", e)  # 内部日志保留细节，不回传给客户端
+        logger.warning("upstream error: %s", e)  # 内部日志保留细节，不回传给客户端
         return JSONResponse({"detail": "上游服务暂时不可用，请稍后重试"}, status_code=502)
 
 
@@ -974,7 +1030,7 @@ def _record_history(username, keyword, src, data):
                 "VALUES(?,?,?,?,?,?)",
                 (username, keyword, total, counts, src, now_ts()))
     except Exception as e:
-        print("[portal] record history failed:", e)
+        logger.warning("record history failed: %s", e)
 
 
 def _record_event(ip, keyword, src, data):
@@ -992,7 +1048,7 @@ def _record_event(ip, keyword, src, data):
                     time.localtime(time.time() - EVENT_KEEP_DAYS * 86400))
                 conn.execute("DELETE FROM events WHERE ts<?", (cut,))
     except Exception as e:
-        print("[portal] record event failed:", e)
+        logger.warning("record event failed: %s", e)
 
 
 # ---------------- 分桶域名复核：插件自报类型与 URL 域名冲突时以域名为准 ----------------
@@ -1304,7 +1360,7 @@ async def _search_proxy(request: Request, username: str):
             local_mbt = _fts_local_search(keyword)
             local_total = sum(len(v) for v in local_mbt.values())
         except Exception as e:
-            print("[portal] local search error:", e)
+            logger.warning("local search error: %s", e)
         if local_total >= FTS_MIN_HITS:
             # 档2：英文词本地命中也注入海外磁力（短超时，失败静默）
             try:
@@ -1317,7 +1373,7 @@ async def _search_proxy(request: Request, username: str):
                         local_mbt["magnet"] = ext_m + (local_mbt.get("magnet") or [])
                         local_total = sum(len(v) for v in local_mbt.values())
             except Exception as e:
-                print("[portal] magnet swr error:", e)
+                logger.warning("magnet swr error: %s", e)
             # C：本地结果同样做同版本去重；A+B：先剔除已确认死链，再后台全量净化
             local_mbt, local_deduped = _dedup_mbt(local_mbt)
             local_mbt, local_dead_hidden = _filter_dead_mbt(local_mbt)
@@ -1378,7 +1434,7 @@ async def _search_proxy(request: Request, username: str):
                             # PanSou 0 结果时 data 无 merged_by_type 键，需写回
                             data.setdefault("merged_by_type", mbt)
                 except Exception as e:
-                    print("[portal] magnet inject error:", e)
+                    logger.warning("magnet inject error: %s", e)
                 # 域名复核：插件自报类型与链接域名冲突时以域名为准
                 mbt = _rebucket_by_domain(mbt)
                 # 方案一：主词供给不足时按需多路变体召回（仅 GET + 全源），合并后统一净化
@@ -1393,7 +1449,7 @@ async def _search_proxy(request: Request, username: str):
                             for d, its in extra_mbt.items():
                                 mbt[d] = list(mbt.get(d, [])) + list(its)
                     except Exception as e:
-                        print("[portal] multi recall error:", e)
+                        logger.warning("multi recall error: %s", e)
                         v_count = v_added = 0
                 # C：同版本标题指纹去重，削减模板化批量堆量的雷同链接
                 mbt, deduped = _dedup_mbt(mbt)
@@ -1452,7 +1508,7 @@ async def _search_proxy(request: Request, username: str):
         return Response(content=content, status_code=upstream.status_code,
                         headers={"content-type": ctype})
     except httpx.RequestError as e:
-        print("[portal] search upstream error:", e)
+        logger.warning("search upstream error: %s", e)
         return JSONResponse({"detail": "搜索服务暂时不可用，请稍后重试"},
                             status_code=502)
 
@@ -2364,7 +2420,7 @@ def _fts_local_search(kw: str):
                         seen.add(r["url"])
                         ordered.append(r["url"])
             except Exception as e:
-                print("[portal] fts match error:", kw, e)
+                logger.warning("fts match error kw=%s: %s", kw, e)
         # 2) LIKE 兜底/补充（短词、子串），转义 % _ \，按画质分；
         #    同时匹配 note 与 kws（JSON），让 2 字短词也能命中关联的英文标题。
         like = kw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
@@ -2426,7 +2482,7 @@ async def _internal_search(keyword: str, client: httpx.AsyncClient):
         return _rebucket_by_domain(
             payload.get("data", {}).get("merged_by_type") or {})
     except Exception as e:
-        print("[portal] internal search failed:", keyword, e)
+        logger.warning("internal search failed kw=%s: %s", keyword, e)
         return {}
 
 
@@ -2566,8 +2622,8 @@ async def check_watches():
                         (newest, len(arts), row["id"]))
                 await asyncio.sleep(3)
             except Exception as e:
-                print("[portal] watch check failed for",
-                      row["keyword"], e)
+                logger.warning("watch check failed for %s: %s",
+                               row["keyword"], e)
 
 
 async def watch_loop():
@@ -2576,7 +2632,7 @@ async def watch_loop():
         try:
             await check_watches()
         except Exception as e:
-            print("[portal] watch_loop error:", e)
+            logger.warning("watch_loop error: %s", e)
         await asyncio.sleep(WATCH_INTERVAL_SEC)
 
 
@@ -2602,7 +2658,7 @@ async def _fts_collect_words(client: httpx.AsyncClient):
         for it in (tv if isinstance(tv, list) else []):
             add(it.get("title"), "trending")
     except Exception as e:
-        print("[portal] fts collect trending failed:", e)
+        logger.warning("fts collect trending failed: %s", e)
     # 2) 用户高频搜索词 + 3) 追剧词（直接查 DB）
     week_cut = time.strftime("%Y-%m-%dT%H:%M:%S",
                              time.localtime(time.time() - 7 * 86400))
@@ -2650,11 +2706,11 @@ async def _fts_fill(force: bool = False):
             n = _fts_upsert(kw, mbt)
             _fts_mark_job(kw, n, src)
             done += 1
-            print("[portal] fts fill %s -> %d (%.1fs)"
-                  % (kw, n, time.time() - t0), flush=True)
+            logger.info("fts fill %s -> %d (%.1fs)",
+                        kw, n, time.time() - t0)
             await asyncio.sleep(FTS_WORD_GAP)
     purged = _fts_purge_stale()
-    print("[portal] fts fill done: %d words, purged %d" % (done, purged))
+    logger.info("fts fill done: %d words, purged %d", done, purged)
 
 
 async def _fts_backfill(kw: str, mbt: dict):
@@ -2663,7 +2719,7 @@ async def _fts_backfill(kw: str, mbt: dict):
         n = _fts_upsert(kw, mbt)
         _fts_mark_job(kw, n, "search")
     except Exception as e:
-        print("[portal] fts backfill error:", e)
+        logger.warning("fts backfill error: %s", e)
 
 
 async def _fts_bg_refresh(kw: str):
@@ -2712,7 +2768,7 @@ async def _fts_bg_refresh(kw: str):
                         {u: verdict[u] for u in pending if u in verdict},
                         url_source)
     except Exception as e:
-        print("[portal] fts bg refresh error:", e)
+        logger.warning("fts bg refresh error: %s", e)
 
 
 async def fts_loop():
@@ -2721,12 +2777,13 @@ async def fts_loop():
         try:
             await _fts_fill()
         except Exception as e:
-            print("[portal] fts_loop error:", e)
+            logger.warning("fts_loop error: %s", e)
         await asyncio.sleep(FTS_FILL_INTERVAL)
 
 
 @app.on_event("startup")
 async def _start_watch():
+    asyncio.create_task(backup_loop())
     asyncio.create_task(watch_loop())
     if FTS_ENABLED:
         asyncio.create_task(fts_loop())

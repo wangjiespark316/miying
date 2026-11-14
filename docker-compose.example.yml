@@ -92,6 +92,13 @@ services:
       - FTS_MAX_WORDS=30
       - FTS_MAX_ARTS_PER_WORD=60
       - FTS_QUERY_LIMIT=80
+      # 日志级别（DEBUG/INFO/WARNING/ERROR）
+      - LOG_LEVEL=INFO
+      # SQLite 自动备份：启动一份 + 每日在线备份，仅保留最新 N 份
+      - BACKUP_ENABLED=1
+      - BACKUP_DIR=/app/data/backups
+      - BACKUP_KEEP=7
+      - BACKUP_INTERVAL_SEC=86400
     volumes:
       - ./portal-data:/app/data
     mem_limit: 192m
@@ -101,3 +108,10 @@ services:
       options:
         max-size: "5m"
         max-file: "2"
+    # 镜像为 python:3.12-slim（无 curl），用自带 python 探活；只反映门脸进程可响应
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1/portal/health', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
