@@ -13,13 +13,17 @@ services:
     environment:
       # 上游 PanSou 访问 Telegram 频道的代理（如本机/旁路由 Clash 的 socks5）
       - PROXY=socks5://<代理用户名>:<代理密码>@<旁路由IP>:7891
-      # 订阅的 Telegram 频道逗号分隔
-      - CHANNELS=tgsearchers7,Baidu_netdisk,bdwpzhpd,baidyunpan,rbzhwpzy,bdbdndn11,jdjdn1111,BaiduCloudDisk,Aliyun_4K_Movies,dianying4k,MCPH02,MCPH03,Q66Share,gimy115iso,PikPak_Share_Channel,guoman4K,Netdisk_Movies,PanjClub,baicaoZY,gotopan,ciliziyuanku
-      - ENABLED_PLUGINS=hunhepan,pansearch,qqpd,labi,zhizhen,shandian,duoduo,muou,xiaokupan,erxiaoaipan,aipan,pan365
+      # 订阅的 Telegram 频道逗号分隔（2026-11-13 生产在用 41 个，均为公开频道，可按需删减）
+      - CHANNELS=tgsearchers7,Baidu_netdisk,bdwpzhpd,baidyunpan,rbzhwpzy,bdbdndn11,jdjdn1111,BaiduCloudDisk,Aliyun_4K_Movies,dianying4k,MCPH02,MCPH03,Q66Share,gimy115iso,PikPak_Share_Channel,guoman4K,Netdisk_Movies,PanjClub,baicaoZY,gotopan,ciliziyuanku,yp123pan,xx123pan,yingshifenxiang123,Lsp115,Channel_Shares_115,vip115hot,ucwpzy,ucquark,yunpanuc,yunpanxunlei,XunLeiPinDao,tianyifc,yunpan189,shareAliyun,Quark_Movies,Oscar_4Kmovies,MCPH01,cilidianying,Q_dongman,yoyokuakeduanju
+      # 第三方资源站插件白名单：2026-11-13 对上游 113 个插件全量灰度实测后精选的 28 个存活源（含 5 个 BT/磁力源）。
+      # 第三方站点会周期性失效，后续请以 PanSou 上游 plugin 目录实测为准增删，勿盲目全开。
+      - ENABLED_PLUGINS=zhizhen,shandian,duoduo,muou,xiaokupan,aipan,haitunsou,quark4k,xiaozhang,yunso,btbtlb,clmao,5266ys,dygang,lou1,miosou,nyaa,melost,xiaoyu,yingso,ikantv,huban,erxiaopan,hjzhencai,meitizy,kkv,libvio,jutoushe
       - CACHE_ENABLED=true
       - CACHE_TTL=60
       - MAX_CONCURRENCY=40
-      - ASYNC_RESPONSE_TIMEOUT=3
+      # 异步快速响应窗口（秒）：调大可让慢网盘源赶上首轮，代价是冷查尾部延迟略增；TG 频道软截止单独控制
+      - ASYNC_RESPONSE_TIMEOUT=5
+      - TG_CHANNEL_TIMEOUT_SECONDS=2
       # PanSou 自身认证关闭（认证由 portal 长效令牌负责）
       - AUTH_ENABLED=false
     volumes:
@@ -64,11 +68,18 @@ services:
       - ALERT_COOLDOWN_SEC=900
       # 事件明细保留 30 天
       - EVENT_KEEP_DAYS=30
-      # 失效链接检测：搜索后自动检测画质排序前 N 条，确认失效的隐藏
-      - VERIFY_N=15
-      - VERIFY_WORKERS=12
+      # 失效链接检测：搜索后同步验证前 N 条（每类网盘先保底），确认失效的隐藏
+      - VERIFY_N=40
+      - VERIFY_WORKERS=16
       - VERIFY_CACHE_TTL=1800
       - VERIFY_TIMEOUT=3
+      # A：每个网盘类型保底验证条数；B：后台全量净化单次安全上限
+      - VERIFY_PER_TYPE=8
+      - VERIFY_BG_LIMIT=160
+      # C：同版本指纹去重开关；来源健康度降权最小样本与系数下限
+      - DEDUP_ENABLED=1
+      - SOURCE_HEALTH_MIN=10
+      - SOURCE_HEALTH_FLOOR=0.5
       # 混合 FTS5 预索引：搜索先查本地（约百毫秒），未命中再回源，后台异步回填
       - FTS_ENABLED=1
       - FTS_FILL_INTERVAL=21600

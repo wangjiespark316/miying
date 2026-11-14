@@ -58,10 +58,19 @@ LOGIN_MAX_FAIL = int(os.environ.get("LOGIN_MAX_FAIL", "8"))
 LOGIN_LOCK_SEC = int(os.environ.get("LOGIN_LOCK_SEC", "900"))
 
 # 链接失效检测
-VERIFY_N = int(os.environ.get("VERIFY_N", "15"))
-VERIFY_WORKERS = int(os.environ.get("VERIFY_WORKERS", "12"))
+# A：默认同步验证窗口由 15 提到 40，并对每个网盘类型保底各验前若干条，
+# 避免百度这类被高画质夸克挤出全局前 N 窗口、后排死链无人检测。
+VERIFY_N = int(os.environ.get("VERIFY_N", "40"))
+VERIFY_WORKERS = int(os.environ.get("VERIFY_WORKERS", "16"))
 VERIFY_CACHE_TTL = int(os.environ.get("VERIFY_CACHE_TTL", "1800"))
 VERIFY_TIMEOUT = float(os.environ.get("VERIFY_TIMEOUT", "3"))
+VERIFY_PER_TYPE = int(os.environ.get("VERIFY_PER_TYPE", "8"))
+# B：首屏返回后，后台对该词剩余链接异步全量净化的单次安全上限（防超大词打爆）
+VERIFY_BG_LIMIT = int(os.environ.get("VERIFY_BG_LIMIT", "160"))
+# C：同版本标题指纹去重开关；来源健康度降权的最小样本与系数下限（样本不足不惩罚）
+DEDUP_ENABLED = bool(int(os.environ.get("DEDUP_ENABLED", "1")))
+SOURCE_HEALTH_MIN = int(os.environ.get("SOURCE_HEALTH_MIN", "10"))
+SOURCE_HEALTH_FLOOR = float(os.environ.get("SOURCE_HEALTH_FLOOR", "0.5"))
 
 # 海报图片代理：海报多为 Telegram CDN（telesco.pe，国内直连被墙），
 # 由 portal 经 HTTP 代理回源后转发，浏览器只走同源，不直连图床。
@@ -105,6 +114,132 @@ FTS_STATIC_WORDS = ["沙丘2", "阿凡达", "让子弹飞", "奥本海默", "流
                     "消失的她", "沙丘", "阿凡达3", "庆余年", "繁花",
                     "与凤行", "黑神话悟空", "三体", "狂飙", "我是刑警"]
 
+# 追剧更新监控
+
+# ---------------- 海外英文磁力源（档2：apibay + yts） ----------------
+# 搜索含英文字母的词时，并行查询海盗湾官方 JSON API（直连）与 YTS API（走
+# POSTER_PROXY 代理），把英文片磁力种子注入 merged_by_type.magnet。
+# 纯中文词跳过（海外源命中率极低且拖慢响应）；失败静默降级不影响主流程。
+MAGNET_ENABLED = bool(int(os.environ.get("MAGNET_ENABLED", "1")))
+MAGNET_CACHE_TTL = int(os.environ.get("MAGNET_CACHE_TTL", "600"))
+MAGNET_TIMEOUT = float(os.environ.get("MAGNET_TIMEOUT", "10"))
+MAGNET_APIBAY_MAX = int(os.environ.get("MAGNET_APIBAY_MAX", "20"))
+MAGNET_YTS_MAX = int(os.environ.get("MAGNET_YTS_MAX", "10"))
+_MAGNET_CACHE: dict = {}
+# fire-and-forget 后台任务强引用，防止任务被 GC 提前回收（asyncio 官方模式）
+_background_tasks: set = set()
+
+
+def _magnet_item(name: str, info_hash: str, source: str,
+                 seeds: int = 0, size: str = "") -> dict:
+    note = name
+    if size:
+        note = "%s %s" % (note, size)
+    if seeds:
+        note = "%s [%d做种]" % (note, seeds)
+    return {
+        "url": "magnet:?xt=urn:btih:%s&dn=%s" % (info_hash, quote(name)),
+        "password": "",
+        "note": note,
+        "source": "plugin:" + source,
+        "datetime": "",
+    }
+
+
+async def _fetch_apibay(kw: str, to: httpx.Timeout) -> list:
+    url = "https://apibay.org/q.php?q=" + quote(kw)
+    kwarg = dict(timeout=to, headers={"User-Agent": UA})
+    if POSTER_PROXY:
+        kwarg["proxy"] = POSTER_PROXY
+    async with httpx.AsyncClient(**kwarg) as c:
+        resp = await c.get(url)
+        rows = resp.json()
+    out = []
+    for r in rows or []:
+        if str(r.get("id") or "0") == "0":
+            continue  # apibay 的 "No results returned" 占位条目
+        ih = (r.get("info_hash") or "").strip()
+        name = (r.get("name") or "").strip()
+        if not ih or not name or len(ih) != 40 or ih == "0" * 40:
+            continue
+        try:
+            seeds = int(r.get("seeders") or 0)
+        except Exception:
+            seeds = 0
+        out.append((seeds, _magnet_item(name, ih, "apibay", seeds)))
+    out.sort(key=lambda x: -x[0])
+    return [it for _, it in out[:MAGNET_APIBAY_MAX]]
+
+
+async def _fetch_yts(kw: str, to: httpx.Timeout) -> list:
+    url = "https://yts.rs/api/v2/list_movies.json?query_term=" + quote(kw)
+    kwarg = dict(timeout=to, headers={"User-Agent": UA})
+    if POSTER_PROXY:
+        kwarg["proxy"] = POSTER_PROXY
+    async with httpx.AsyncClient(**kwarg) as c:
+        resp = await c.get(url)
+        data = resp.json()
+    out = []
+    for m in (data.get("data") or {}).get("movies") or []:
+        title = (m.get("title") or "").strip()
+        year = m.get("year") or ""
+        for t in m.get("torrents") or []:
+            h = (t.get("hash") or "").strip()
+            if not h:
+                continue
+            q = (t.get("quality") or "").strip()
+            typ = (t.get("type") or "").strip()
+            size = (t.get("size") or "").strip()
+            try:
+                seeds = int(t.get("seeds") or 0)
+            except Exception:
+                seeds = 0
+            name = title
+            if year:
+                name = "%s (%s)" % (name, year)
+            tags = " / ".join(x for x in (q, typ, size) if x)
+            if tags:
+                name = "%s [%s]" % (name, tags)
+            out.append((seeds, _magnet_item(name, h, "yts", seeds)))
+    out.sort(key=lambda x: -x[0])
+    return [it for _, it in out[:MAGNET_YTS_MAX]]
+
+
+async def _fetch_magnets(kw: str, soft: bool = False) -> dict:
+    """并发查 apibay(直连)+yts(代理)，注入 magnet。失败静默。
+    soft=True 用于本地命中(SWR)路径：更短超时，避免拖慢秒开响应。"""
+    if not MAGNET_ENABLED or not re.search(r"[A-Za-z]", kw):
+        return {}
+    key = kw.strip().lower()
+    now = time.time()
+    if key in _MAGNET_CACHE and _MAGNET_CACHE[key][0] > now:
+        return _MAGNET_CACHE[key][1]
+    if soft:
+        ato = httpx.Timeout(2.5, connect=2.0)
+        yto = httpx.Timeout(3.0, connect=2.5)
+        limit = 4.0
+    else:
+        ato = httpx.Timeout(6.0, connect=4.0)
+        yto = httpx.Timeout(8.0, connect=5.0)
+        limit = MAGNET_TIMEOUT
+    result = {}
+    try:
+        r1, r2 = await asyncio.wait_for(
+            asyncio.gather(_fetch_apibay(kw, ato), _fetch_yts(kw, yto),
+                           return_exceptions=True), timeout=limit)
+        items = []
+        for r in (r1, r2):
+            if isinstance(r, Exception):
+                print("[portal] magnet fetch error:", r)
+            else:
+                items.extend(r)
+        if items:
+            result = {"magnet": items}
+    except Exception as e:
+        print("[portal] magnet error:", e)
+    _MAGNET_CACHE[key] = (time.time() + MAGNET_CACHE_TTL, result)
+    return result
+
 # 追剧更新监控：后台定时检索订阅词，发现比基线新的资源即推送
 WATCH_INTERVAL_SEC = int(os.environ.get("WATCH_INTERVAL_SEC", "7200"))
 WATCH_STARTUP_DELAY = int(os.environ.get("WATCH_STARTUP_DELAY", "90"))
@@ -144,6 +279,10 @@ _last_alert = {}          # ip -> 上次告警时间
 _verify_cache = {}        # url -> (status, ts)，status: "alive" / "dead"
 _login_fails = {}         # ip -> [fail_ts, ...]
 _login_locks = {}         # ip -> lock_until_ts
+# A+B+C：持久化死链与来源健康度的内存视图（启动从 sqlite 预热，读路径 O(1)）
+_dead_urls: set = set()           # 已确认失效 URL，任意响应路径返回前统一过滤
+_verify_inflight: set = set()     # 后台深度验证进行中的 URL，避免跨请求重复打
+_src_health: dict = {}            # source -> [alive, dead] 累计计数，用于温和降权
 
 
 # ---------------- 安全响应头 ----------------
@@ -268,7 +407,22 @@ def init_db():
             n INTEGER DEFAULT 0,
             last_run REAL,
             src TEXT DEFAULT '')""")
+        # ---- A+B+C：死链持久化 + 来源健康度（平滑升级，旧库自动补建）----
+        db.execute("""CREATE TABLE IF NOT EXISTS dead_links(
+            url TEXT PRIMARY KEY,
+            title TEXT DEFAULT '',
+            ts REAL NOT NULL)""")
+        db.execute("""CREATE TABLE IF NOT EXISTS source_health(
+            source TEXT PRIMARY KEY,
+            alive INTEGER NOT NULL DEFAULT 0,
+            dead INTEGER NOT NULL DEFAULT 0,
+            updated REAL)""")
         db.execute("PRAGMA journal_mode=WAL")
+        # 预热内存视图：死链集合与来源计数，重启不丢、跨关键词复用
+        for r in db.execute("SELECT url FROM dead_links"):
+            _dead_urls.add(r[0])
+        for r in db.execute("SELECT source, alive, dead FROM source_health"):
+            _src_health[r[0]] = [int(r[1] or 0), int(r[2] or 0)]
     try:
         os.chmod(DB_PATH, 0o600)
     except OSError:
@@ -431,6 +585,187 @@ def quality_score(item: dict) -> int:
     return sum(w for t, w in QUALITY_SCORE if t in text)
 
 
+# ---------------- C：同版本标题指纹去重 + 来源健康度降权 ----------------
+# 画质/版本档位 token：指纹里单独成档，保证同名的 4K 与 1080p 等不同版本不被折叠
+_FP_QUALITY_TOKENS = (
+    "remux", "蓝光原盘", "原盘", "杜比视界", "dolby vision", "杜比全景声",
+    "4k", "uhd", "2160p", "hdr10", "hdr", "蓝光", "bluray", "1080p",
+    "高码", "60fps", "国英", "双音", "特效字幕", "双语",
+)
+# 连载期号/更新进度/年份日期等会变、但指向同一作品同一版本的噪音片段
+_FP_NOISE_PATTERNS = (
+    r"更新至[^0-9]{0,6}[0-9.]+\s*期?",
+    r"更至[^0-9]{0,6}[0-9.]+\s*期?",
+    r"更新[^0-9]{0,6}[0-9.]+\s*期?",
+    r"更\s*[0-9.]+\s*期?",
+    r"第\s*[0-9.]+\s*期", r"[0-9.]+\s*期",
+    r"\d{1,2}\s*月\s*\d{1,2}\s*[日号]",
+    r"(?:19|20)\d{2}\s*年?", r"(?:19|20)\d{2}",
+)
+
+
+def _title_fingerprint(note: str, drive: str, url: str = ""):
+    """归一化出 (网盘类型, 画质档位集合, 核心片名) 指纹。
+    剥离 emoji/标签/括号标点、连载期号与年份；核心片名为空时退回唯一键，绝不合并。"""
+    s = (note or "").lower()
+    tokens = tuple(sorted({t for t in _FP_QUALITY_TOKENS if t in s}))
+    for t in tokens:
+        s = s.replace(t, " ")
+    for pat in _FP_NOISE_PATTERNS:
+        s = re.sub(pat, " ", s)
+    core = re.sub(r"[^0-9a-z一-鿿]+", "", s)
+    if not core:                      # 信息不足，保守不折叠
+        core = "uniq:" + (url or "")
+    return drive or "", tokens, core
+
+
+def _dedup_mbt(mbt: dict):
+    """同网盘、同画质档位、同核心片名的雷同链接只留画质分最高的一条；
+    magnet 为不同 info_hash 的独立资源，不做标题去重。返回 (新mbt, 删除条数)。"""
+    if not DEDUP_ENABLED:
+        return mbt, 0
+    out, dropped = {}, 0
+    for drive, items in (mbt or {}).items():
+        if drive == "magnet":
+            out[drive] = list(items)
+            continue
+        kept, idx_of, seen_url = [], {}, set()
+        for it in items:
+            u = (it.get("url") or "").strip()
+            if not u:
+                continue
+            if u in seen_url:
+                dropped += 1
+                continue
+            fp = _title_fingerprint(it.get("note") or "", drive, u)
+            if fp in idx_of:
+                dropped += 1
+                k = idx_of[fp]
+                if quality_score(it) > quality_score(kept[k]):
+                    kept[k] = it
+                continue
+            seen_url.add(u)
+            idx_of[fp] = len(kept)
+            kept.append(it)
+        if kept:
+            out[drive] = kept
+    return out, dropped
+
+
+def _source_factor(source: str) -> float:
+    """来源滚动失效率 -> 温和排序系数。样本不足不惩罚；最差也只降到下限，不隐藏。"""
+    rec = _src_health.get((source or "").strip())
+    if not rec:
+        return 1.0
+    alive, dead = int(rec[0]), int(rec[1])
+    n = alive + dead
+    if n < SOURCE_HEALTH_MIN:
+        return 1.0
+    rate = dead / n if n else 0.0
+    return max(SOURCE_HEALTH_FLOOR, 1.0 - rate * (1.0 - SOURCE_HEALTH_FLOOR))
+
+
+def effective_score(item: dict) -> float:
+    return quality_score(item) * _source_factor(item.get("source") or "")
+
+
+def _select_check_urls(mbt: dict, ranked: list) -> list:
+    """A：ranked 为全局有效分降序的 url 列表。先给每个网盘类型保底取前
+    VERIFY_PER_TYPE 条，再按全局顺序补足到 VERIFY_N；magnet 不做 HTTP 验证。"""
+    drive_of, per_type = {}, {}
+    for drive, items in (mbt or {}).items():
+        for it in items:
+            u = (it.get("url") or "").strip()
+            if u:
+                drive_of.setdefault(u, drive)
+    http_ranked = [u for u in ranked
+                   if u in drive_of and not u.startswith("magnet:")]
+    for u in http_ranked:
+        per_type.setdefault(drive_of[u], []).append(u)
+    chosen, picked = [], set()
+    for drive in (mbt or {}).keys():
+        for u in per_type.get(drive, [])[:VERIFY_PER_TYPE]:
+            if u not in picked:
+                picked.add(u)
+                chosen.append(u)
+    for u in http_ranked:
+        if len(chosen) >= VERIFY_N:
+            break
+        if u not in picked:
+            picked.add(u)
+            chosen.append(u)
+    return chosen[:VERIFY_N]
+
+
+def _filter_dead_mbt(mbt: dict):
+    """任意响应路径返回前，用持久化死链集合统一过滤。返回 (新mbt, 剔除条数)。"""
+    if not _dead_urls:
+        return mbt, 0
+    out, removed = {}, 0
+    for drive, items in (mbt or {}).items():
+        kept = [it for it in items
+                if (it.get("url") or "").strip() not in _dead_urls]
+        removed += len(items) - len(kept)
+        if kept:
+            out[drive] = kept
+    return out, removed
+
+
+def _url_source_map(mbt: dict) -> dict:
+    mp = {}
+    for items in (mbt or {}).values():
+        for it in items:
+            u = (it.get("url") or "").strip()
+            if u:
+                mp.setdefault(u, (it.get("source") or "unknown").strip()
+                              or "unknown")
+    return mp
+
+
+def _record_verdicts(verdict: dict, url_source: dict):
+    """验证结果落 dead_links/source_health，同步内存死链、来源计数与 FTS 索引。"""
+    if not verdict:
+        return
+    now = time.time()
+    dead_now = [u for u, st in verdict.items() if st == "dead"]
+    alive_now = [u for u, st in verdict.items() if st != "dead"]
+    try:
+        with db() as conn:
+            for u in dead_now:
+                conn.execute(
+                    "INSERT INTO dead_links(url,title,ts) VALUES(?,?,?) "
+                    "ON CONFLICT(url) DO UPDATE SET ts=excluded.ts",
+                    (u, "", now))
+            if alive_now:
+                conn.executemany("DELETE FROM dead_links WHERE url=?",
+                                 [(u,) for u in alive_now])
+            for u in dead_now:
+                src = url_source.get(u, "unknown")
+                conn.execute(
+                    "INSERT INTO source_health(source,dead,updated) VALUES(?,1,?) "
+                    "ON CONFLICT(source) DO UPDATE SET dead=dead+1,"
+                    "updated=excluded.updated", (src, now))
+            for u in alive_now:
+                src = url_source.get(u, "unknown")
+                conn.execute(
+                    "INSERT INTO source_health(source,alive,updated) VALUES(?,1,?) "
+                    "ON CONFLICT(source) DO UPDATE SET alive=alive+1,"
+                    "updated=excluded.updated", (src, now))
+        for u in dead_now:
+            _dead_urls.add(u)
+            _src_health.setdefault(url_source.get(u, "unknown"), [0, 0])[1] += 1
+        for u in alive_now:
+            _dead_urls.discard(u)
+            _src_health.setdefault(url_source.get(u, "unknown"), [0, 0])[0] += 1
+        for u in dead_now:                     # FTS 移除放在事务连接外，避免嵌套连接
+            try:
+                _fts_remove_url(u)
+            except Exception:
+                pass
+    except Exception as e:
+        print("[portal] record verdicts error:", e)
+
+
 # ---------------- 链接失效检测 ----------------
 async def _check_one(url: str, client: httpx.AsyncClient):
     try:
@@ -467,6 +802,50 @@ async def verify_urls(urls, client: httpx.AsyncClient):
             verdict[u] = status
             _verify_cache[u] = (status, now)
     return verdict
+
+
+def _pending(urls: list) -> list:
+    """筛出验证缓存已过期/不存在、本次需要真正发起请求的 URL。
+    健康度只对新检测结果计数，避免缓存命中被反复累加。"""
+    now = time.time()
+    return [u for u in urls
+            if not (u in _verify_cache and now - _verify_cache[u][1] < VERIFY_CACHE_TTL)]
+
+
+async def _bg_deep_verify(keyword: str, mbt: dict):
+    """B：首屏返回后，后台把该词剩余链接全量验证（受 VERIFY_BG_LIMIT 安全阀约束、
+    跨请求 in-flight 去重、信号量限流复用 VERIFY_WORKERS）。死链落库并移出 FTS，
+    下次刷新/搜索即消失；alive 则允许复活。全程异常静默，绝不影响响应链路。"""
+    try:
+        now = time.time()
+        todo, seen = [], set()
+        for items in (mbt or {}).values():
+            for it in items:
+                u = (it.get("url") or "").strip()
+                if not u or u.startswith("magnet:") or u in seen:
+                    continue
+                seen.add(u)
+                if u in _verify_inflight:
+                    continue
+                if u in _verify_cache and now - _verify_cache[u][1] < VERIFY_CACHE_TTL:
+                    continue
+                todo.append(u)
+        todo = todo[:VERIFY_BG_LIMIT]
+        if not todo:
+            return
+        for u in todo:
+            _verify_inflight.add(u)
+        url_source = _url_source_map(mbt)
+        try:
+            async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(VERIFY_TIMEOUT + 2),
+                    follow_redirects=True) as vclient:
+                verdict = await verify_urls(todo, vclient)
+            _record_verdicts(verdict, url_source)
+        finally:
+            _verify_inflight.difference_update(todo)
+    except Exception as e:
+        print("[portal] bg deep verify error:", keyword, e)
 
 
 # ---------------- 滥用检测 / 告警 ----------------
@@ -607,6 +986,52 @@ def _record_event(ip, keyword, src, data):
         print("[portal] record event failed:", e)
 
 
+# ---------------- 分桶域名复核：插件自报类型与 URL 域名冲突时以域名为准 ----------------
+# 只收录能确定归属的分享页域名（域名/子域后缀匹配）；未知域名保留原桶，保守不误迁
+DRIVE_DOMAIN_RULES = [
+    ("quark", ("pan.quark.cn",)),
+    ("baidu", ("pan.baidu.com", "yun.baidu.com", "pan.bdimg.com")),
+    ("aliyun", ("alipan.com", "aliyundrive.com")),
+    ("uc", ("drive.uc.cn", "fast.uc.cn", "pan.uc.cn")),
+    ("115", ("115cdn.com", "115.com")),
+    ("xunlei", ("pan.xunlei.com",)),
+    ("mobile", ("yun.139.com", "caiyun.139.com", "clouds.139.com")),
+    ("123", ("123pan.com", "123912.com", "123684.com", "123865.com")),
+    ("tianyi", ("cloud.189.cn",)),
+    # 真实分享页可见 toapp.mypikpak.com 跳转域，一并纳入
+    ("pikpak", ("pikpak.com", "pikpak.cloud", "mypikpak.com")),
+    ("guangya", ("guangyapan.com",)),
+]
+
+
+def _drive_by_url(url: str):
+    """按分享页 URL 域名推断网盘类型；magnet 链归 magnet；无法判定返回 None。"""
+    u = (url or "").strip()
+    if u.startswith("magnet:"):
+        return "magnet"
+    try:
+        host = (urlparse(u).hostname or "").lower()
+    except Exception:
+        return None
+    if not host:
+        return None
+    for drive, suffixes in DRIVE_DOMAIN_RULES:
+        if host in suffixes or any(host.endswith("." + s) for s in suffixes):
+            return drive
+    return None
+
+
+def _rebucket_by_domain(mbt: dict) -> dict:
+    """按 URL 域名复核 merged_by_type 分桶。
+    域名可判定且与插件自报类型冲突时以域名为准；未知域名/异常 URL 保留原桶；空桶移除。"""
+    out = {}
+    for typ, items in (mbt or {}).items():
+        for it in items:
+            target = _drive_by_url(it.get("url") or "") or typ
+            out.setdefault(target, []).append(it)
+    return out
+
+
 def _inject_clean_filter(request: Request, body: bytes):
     """默认只看正片：未显式传 filter 且 clean!=0 时，注入默认排除词。"""
     qs = dict(request.query_params)
@@ -645,11 +1070,32 @@ async def _search_proxy(request: Request, username: str):
         except Exception as e:
             print("[portal] local search error:", e)
         if local_total >= FTS_MIN_HITS:
+            # 档2：英文词本地命中也注入海外磁力（短超时，失败静默）
+            try:
+                ext = await _fetch_magnets(keyword, soft=True)
+                ext_m = ext.get("magnet") or []
+                if ext_m:
+                    seen = {u.get("url") for u in (local_mbt.get("magnet") or [])}
+                    ext_m = [it for it in ext_m if it.get("url") not in seen]
+                    if ext_m:
+                        local_mbt["magnet"] = ext_m + (local_mbt.get("magnet") or [])
+                        local_total = sum(len(v) for v in local_mbt.values())
+            except Exception as e:
+                print("[portal] magnet swr error:", e)
+            # C：本地结果同样做同版本去重；A+B：先剔除已确认死链，再后台全量净化
+            local_mbt, local_deduped = _dedup_mbt(local_mbt)
+            local_mbt, local_dead_hidden = _filter_dead_mbt(local_mbt)
+            local_total = sum(len(v) for v in local_mbt.values())
             # 后台刷新（TTL 过期回源 + 验证剔除失效），本次响应不等待
-            asyncio.create_task(_fts_bg_refresh(keyword))
+            bg = asyncio.create_task(_fts_bg_refresh(keyword))
+            _background_tasks.add(bg)
+            bg.add_done_callback(_background_tasks.discard)
+            deep = asyncio.create_task(_bg_deep_verify(keyword, local_mbt))
+            _background_tasks.add(deep)
+            deep.add_done_callback(_background_tasks.discard)
             data = {"merged_by_type": local_mbt, "total": local_total,
-                    "verified": {"checked": 0, "removed": 0,
-                                 "source": "local"}}
+                    "verified": {"checked": 0, "removed": local_dead_hidden,
+                                 "deduped": local_deduped, "source": "local"}}
             if local_total:
                 _record_history(username, keyword, src, data)
             _record_event(ip, keyword, src, data)
@@ -662,6 +1108,14 @@ async def _search_proxy(request: Request, username: str):
                          "X-Source": "local-cache"})
 
     # ===== 本地不足 / miss：回源 PanSou（原完整流程） =====
+    # 方案A：海外磁力查询与核心回源并发（原为核心返回后串行 await）。
+    # _fetch_magnets 内部已全量 try/except 并带 10s 硬顶，失败返 {}，
+    # 磁力路任何超时/报错都不会阻塞或拖垮核心主响应。
+    mag_task = None
+    if keyword:
+        mag_task = asyncio.create_task(_fetch_magnets(keyword))
+        _background_tasks.add(mag_task)
+        mag_task.add_done_callback(_background_tasks.discard)
     try:
         async with httpx.AsyncClient(
                 timeout=httpx.Timeout(180.0, connect=15.0)) as client:
@@ -674,45 +1128,64 @@ async def _search_proxy(request: Request, username: str):
             if payload.get("code") == 0:
                 data = payload.setdefault("data", {})
                 mbt = data.get("merged_by_type") or {}
-                # 展平去重，按画质排序，决定检测前 N 条
+
+                # 档2：海外英文磁力源（apibay/yts），失败不影响主流程
+                # 方案A：任务在核心回源发出时已并发启动，此处取其结果（已完成则立即返回）
+                try:
+                    ext = await mag_task if mag_task is not None else {}
+                    ext_m = ext.get("magnet") or []
+                    if ext_m:
+                        seen = {u.get("url") for u in (mbt.get("magnet") or [])}
+                        ext_m = [it for it in ext_m if it.get("url") not in seen]
+                        if ext_m:
+                            mbt["magnet"] = ext_m + (mbt.get("magnet") or [])
+                            # PanSou 0 结果时 data 无 merged_by_type 键，需写回
+                            data.setdefault("merged_by_type", mbt)
+                except Exception as e:
+                    print("[portal] magnet inject error:", e)
+                # 域名复核：插件自报类型与链接域名冲突时以域名为准
+                mbt = _rebucket_by_domain(mbt)
+                # C：同版本标题指纹去重，削减模板化批量堆量的雷同链接
+                mbt, deduped = _dedup_mbt(mbt)
+                data["merged_by_type"] = mbt
+                # 展平按 URL 去重；排序键 = 画质分 × 来源健康度系数（C 只调序不删除）
                 best = {}
                 for items in mbt.values():
                     for it in items:
                         u = (it.get("url") or "").strip()
                         if not u:
                             continue
-                        s = quality_score(it)
+                        s = effective_score(it)
                         if u not in best or s > best[u][1]:
                             best[u] = (u, s)
                 ranked = sorted(best.values(), key=lambda x: x[1],
                                 reverse=True)
-                check_urls = [u for u, _ in ranked[:VERIFY_N]]
-                removed = 0
+                # A：每个网盘类型保底、再全局补足的首屏同步验证窗口
+                check_urls = _select_check_urls(mbt, [u for u, _ in ranked])
+                url_source = _url_source_map(mbt)
                 if check_urls:
+                    fresh_pending = _pending(check_urls)
                     async with httpx.AsyncClient(
                             timeout=httpx.Timeout(VERIFY_TIMEOUT + 2),
                             follow_redirects=True) as vclient:
                         verdict = await verify_urls(check_urls, vclient)
-                    dead = {u for u, st in verdict.items() if st == "dead"}
-                    new_mbt = {}
-                    for typ, items in mbt.items():
-                        kept = [it for it in items
-                                if (it.get("url") or "").strip() not in dead]
-                        removed += len(items) - len(kept)
-                        if kept:
-                            new_mbt[typ] = kept
-                    data["merged_by_type"] = new_mbt
-                    # 确认失效的链接从本地索引移除（dead 通常很少，sqlite 毫秒级）
-                    for du in dead:
-                        try:
-                            _fts_remove_url(du)
-                        except Exception:
-                            pass
+                    # 仅对本次新检测结果落库/累计健康度，缓存命中项不重复计数
+                    _record_verdicts(
+                        {u: verdict[u] for u in fresh_pending if u in verdict},
+                        url_source)
+                # A+B：本次新判死链 + 历史已确认死链统一剔除（含持久化结果）
+                mbt, removed = _filter_dead_mbt(mbt)
+                data["merged_by_type"] = mbt
                 data["total"] = sum(
                     len(v) for v in data.get("merged_by_type", {}).values())
                 data["verified"] = {
                     "checked": len(check_urls), "removed": removed,
-                    "source": "upstream"}
+                    "deduped": deduped, "source": "upstream"}
+                # B：首屏不等待，后台把该词剩余链接全量验证，死链下次刷新自动消失
+                deep = asyncio.create_task(
+                    _bg_deep_verify(keyword, data["merged_by_type"]))
+                _background_tasks.add(deep)
+                deep.add_done_callback(_background_tasks.discard)
                 # 0 结果不写入用户个人历史（避免污染历史列表）；
                 # 但 events 仍记录（匿名用量/限流/统计需要完整搜索行为）。
                 if data.get("total"):
@@ -1671,7 +2144,8 @@ def _fts_local_search(kw: str):
                 except Exception:
                     continue
                 mbt.setdefault(drive, []).append(item)
-    return mbt
+    # 读路径统一做域名复核，覆盖历史索引中插件自报类型错误的存量数据
+    return _rebucket_by_domain(mbt)
 
 
 def _fts_purge_stale():
@@ -1698,7 +2172,8 @@ async def _internal_search(keyword: str, client: httpx.AsyncClient):
         payload = r.json()
         if payload.get("code") != 0:
             return {}
-        return payload.get("data", {}).get("merged_by_type") or {}
+        return _rebucket_by_domain(
+            payload.get("data", {}).get("merged_by_type") or {})
     except Exception as e:
         print("[portal] internal search failed:", keyword, e)
         return {}
@@ -1967,13 +2442,24 @@ async def _fts_bg_refresh(kw: str):
                     if u:
                         urls.append(u)
             if urls:
-                async with httpx.AsyncClient(
-                        timeout=httpx.Timeout(VERIFY_TIMEOUT + 2),
-                        follow_redirects=True) as vclient:
-                    verdict = await verify_urls(urls[:VERIFY_N], vclient)
-                for u, st in verdict.items():
-                    if st == "dead":
-                        _fts_remove_url(u)
+                # A：后台保鲜也按每类型保底选链，结果统一落持久化死链/健康度
+                ranked_urls = []
+                for items in local.values():
+                    for it in items:
+                        u = (it.get("url") or "").strip()
+                        if u and u not in ranked_urls:
+                            ranked_urls.append(u)
+                check_urls = _select_check_urls(local, ranked_urls)
+                if check_urls:
+                    pending = _pending(check_urls)
+                    url_source = _url_source_map(local)
+                    async with httpx.AsyncClient(
+                            timeout=httpx.Timeout(VERIFY_TIMEOUT + 2),
+                            follow_redirects=True) as vclient:
+                        verdict = await verify_urls(check_urls, vclient)
+                    _record_verdicts(
+                        {u: verdict[u] for u in pending if u in verdict},
+                        url_source)
     except Exception as e:
         print("[portal] fts bg refresh error:", e)
 
