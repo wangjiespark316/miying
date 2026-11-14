@@ -2140,23 +2140,53 @@ def _fb_pick(arr, q: str, year: str):
     return best
 
 
-async def _douban_suggest_cover(q: str, client: httpx.AsyncClient, year: str = ""):
-    url = "https://movie.douban.com/j/subject_suggest?q=" + quote(q)
-    headers = {"User-Agent": DOUBAN_UA,
-               "Referer": "https://movie.douban.com/",
-               "Accept": "application/json, text/plain, */*"}
-    r = await client.get(url, headers=headers)
-    if r.status_code != 200:
-        return None
+def _normalize_douban_cover_url(u: str) -> str:
+    """rexxar 词条返回的是带时效签名的 qnmob3-sign 压缩小图（query 含 sa_cv/sa_ct，
+    过期即失效且分辨率低）。提取其 /view/photo/ 对象路径，改写为 img3 无签名大图，
+    与热榜封面同一稳定图床（门脸 /portal/img 会自动补豆瓣 Referer 绕防盗链），
+    便于持久缓存而不会因签名过期裂图。"""
     try:
-        arr = r.json()
+        p = urlparse(u)
+        if p.netloc.endswith("doubanio.com") and p.path.startswith("/view/photo/"):
+            return "https://img3.doubanio.com" + p.path
+    except Exception:
+        pass
+    return u
+
+
+async def _douban_suggest_cover(q: str, client: httpx.AsyncClient, year: str = ""):
+    # movie.douban.com/j/subject_suggest 与热榜接口同域，已被边缘风控（HTTP 000）。
+    # 改用移动端 rexxar 词条搜索 type=subject，取 subjects.items[].target 归一化后，
+    # 仍交给原有 _fb_pick 做片名/年份相关性打分，缓存与软 miss 行为保持不变。
+    try:
+        r = await client.get(REXXAR_BASE + "/search",
+                             params={"type": "subject", "q": q, "count": 10},
+                             headers=REXXAR_HEADERS)
+        if r.status_code != 200:
+            return None
+        data = r.json()
     except Exception:
         return None
-    if not isinstance(arr, list) or not arr:
+    cells = ((data.get("subjects") or {}).get("items")) or []
+    arr = []
+    for cell in cells:
+        if not isinstance(cell, dict):
+            continue
+        t = cell.get("target") or {}
+        if not isinstance(t, dict) or not t.get("title"):
+            continue
+        cover = t.get("cover_url") or ""
+        arr.append({
+            "title": t.get("title", "") or "",
+            "year": str(t.get("year") or "").strip(),
+            "img": _normalize_douban_cover_url(cover) if cover else "",
+            "id": str(t.get("id") or "").strip(),
+        })
+    if not arr:
         return None
     best = _fb_pick(arr, q, year)
     if best is None:
-        # 相似度都很低时，只要第一条有图也可接受（suggest 本身已按相关性排序）
+        # 相似度都很低时，只要第一条有图也可接受（rexxar 本身已按相关性排序）
         best = next((x for x in arr if x.get("img")), None)
     if not best or not best.get("img"):
         return None
