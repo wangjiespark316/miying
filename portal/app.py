@@ -72,6 +72,15 @@ DEDUP_ENABLED = bool(int(os.environ.get("DEDUP_ENABLED", "1")))
 SOURCE_HEALTH_MIN = int(os.environ.get("SOURCE_HEALTH_MIN", "10"))
 SOURCE_HEALTH_FLOOR = float(os.environ.get("SOURCE_HEALTH_FLOOR", "0.5"))
 
+# 查询改写 / 多路召回（方案一）：主词结果偏少或为 0 时，并发等价变体与
+# 逐级退化词回源，合并后复用同一套去重/死链净化，只在供给不足时触发以控开销。
+QUERY_REWRITE_ENABLED = bool(int(os.environ.get("QUERY_REWRITE_ENABLED", "1")))
+QUERY_VARIANT_MAX = int(os.environ.get("QUERY_VARIANT_MAX", "3"))
+# 主词去重后唯一链接数低于该值才触发变体召回
+QUERY_REWRITE_MIN_HITS = int(os.environ.get("QUERY_REWRITE_MIN_HITS", "8"))
+# 变体回源整体等待硬顶（秒），超时只收已完成的部分，绝不拖垮主响应
+QUERY_VARIANT_TIMEOUT = float(os.environ.get("QUERY_VARIANT_TIMEOUT", "8"))
+
 # 海报图片代理：海报多为 Telegram CDN（telesco.pe，国内直连被墙），
 # 由 portal 经 HTTP 代理回源后转发，浏览器只走同源，不直连图床。
 # 留空=不代理；需要时经环境变量传入，例如 http://user:pass@host:port
@@ -1053,6 +1062,233 @@ def _inject_clean_filter(request: Request, body: bytes):
     return target, body
 
 
+# ---------------- 查询改写 / 多路召回（方案一） ----------------
+# 季数等价（第四季/第4季/4/S4）+ 长查询逐级退化（去年份/类型/演员等限定词），
+# 仅在主词供给不足时并发回源；变体新增结果统一过片名/季/年相关性过滤，防串片串季。
+_CN_DIGIT = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+             "六": 6, "七": 7, "八": 8, "九": 9}
+_TYPE_WORDS = ("电视剧", "连续剧", "综艺", "电影", "纪录片", "动漫", "动画",
+               "国剧", "美剧", "韩剧", "日剧", "港剧", "台剧", "网剧")
+_SEASON_RE = re.compile(r"第\s*(\d+|[一二三四五六七八九十]{1,3})\s*季")
+_SEASON_EN_RE = re.compile(
+    r"(?<![A-Za-z])[Ss]eason\s*(\d{1,2})|(?<![A-Za-z])S(\d{1,2})(?![\d])")
+_YEAR_RE = re.compile(r"(?:19|20)\d{2}")
+_BARE_SEASON_RE = re.compile(r"^(?P<base>.+?)\s*(?P<num>\d{1,2})$")
+
+
+def _cn_num(s: str):
+    """『四/十/十二』等中文小数字转 int，失败返回 None，覆盖季号常见范围。"""
+    if not s:
+        return None
+    if s.isdigit():
+        return int(s)
+    if s == "十":
+        return 10
+    if "十" in s:
+        a, _, b = s.partition("十")
+        tens = _CN_DIGIT.get(a, 1) if a else 1
+        ones = _CN_DIGIT.get(b, 0) if b else 0
+        return tens * 10 + ones
+    if len(s) == 1:
+        return _CN_DIGIT.get(s)
+    val = 0
+    for ch in s:
+        if ch not in _CN_DIGIT:
+            return None
+        val = val * 10 + _CN_DIGIT[ch]
+    return val
+
+
+def _num_to_cn(n: int) -> str:
+    cn = {1: "一", 2: "二", 3: "三", 4: "四", 5: "五", 6: "六",
+          7: "七", 8: "八", 9: "九", 10: "十"}
+    if n in cn:
+        return cn[n]
+    if 10 < n < 20:
+        return "十" + cn.get(n - 10, str(n - 10))
+    return str(n)
+
+
+def _norm_space(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").replace("　", " ")).strip()
+
+
+def _parse_season(keyword: str):
+    """识别查询中的季号，返回 (去季标记后的 base, season_int|None)。"""
+    kw = _norm_space(keyword)
+    m = _SEASON_RE.search(kw)
+    if m:
+        n = _cn_num(m.group(1))
+        return _norm_space(kw[:m.start()] + " " + kw[m.end():]), n
+    m = _SEASON_EN_RE.search(kw)
+    if m:
+        return _norm_space(kw[:m.start()] + " " + kw[m.end():]), \
+            int(m.group(1) or m.group(2))
+    return kw, None
+
+
+def _root_core(keyword: str) -> str:
+    """核心根片名：取首段并去年份/季标记/类型词，丢弃演员等后置限定。"""
+    head = re.split(r"[\s/|｜]+", _norm_space(keyword), 1)[0]
+    head = _YEAR_RE.sub(" ", head)
+    head = _SEASON_RE.sub(" ", head)
+    head = _SEASON_EN_RE.sub(" ", head)
+    for w in _TYPE_WORDS:
+        head = head.replace(w, " ")
+    return _norm_space(head)
+
+
+def _query_variants(keyword: str, limit: int):
+    """生成有序、去重、不含原词的召回变体：先季等价，再长查询逐级退化。"""
+    kw = _norm_space(keyword)
+    if not kw or limit <= 0:
+        return []
+    out, seen = [], set()
+
+    def add(v):
+        v = _norm_space(v)
+        if v and v != kw and v not in seen:
+            seen.add(v)
+            out.append(v)
+
+    base, season = _parse_season(kw)
+    if season is not None and base:
+        add(f"{base} 第{_num_to_cn(season)}季")
+        add(f"{base} 第{season}季")
+        add(f"{base}{season}")
+        add(f"{base} {season}")
+        add(f"{base} S{season}")
+    else:
+        # 无显式季标记时，尝试把结尾裸数字当季号（如『现在就出发4』），4 位年份除外
+        m = _BARE_SEASON_RE.match(base)
+        if m:
+            b, n = _norm_space(m.group("base")), int(m.group("num"))
+            if b and 1 <= n <= 30:
+                add(f"{b} 第{_num_to_cn(n)}季")
+                add(f"{b} 第{n}季")
+                add(f"{b} S{n}")
+
+    # 长查询逐级退化：从尾部逐档去限定词直到首段根片名；遇到季 token 立即停止防串季
+    tokens = [t for t in re.split(r"[\s,，、]+", kw) if t]
+    if len(tokens) >= 2 and len(_root_core(kw)) >= 2:
+        work = list(tokens)
+        while len(work) > 1:
+            if _SEASON_RE.search(work[-1]) or _SEASON_EN_RE.search(work[-1]):
+                break
+            work = work[:-1]
+            add(" ".join(work))
+    return out[:limit]
+
+
+def _title_season(note: str):
+    """从资源标题提取明确季号；识别不到返回 None（不视为冲突，避免误杀）。"""
+    m = _SEASON_RE.search(note or "")
+    if m:
+        return _cn_num(m.group(1))
+    m = _SEASON_EN_RE.search(note or "")
+    if m:
+        return int(m.group(1) or m.group(2))
+    return None
+
+
+_KANA_RE = re.compile(r"[぀-ヿ]")
+
+
+def _root_hits(root: str, low: str) -> bool:
+    """根片名是否在标题中形成一次『干净命中』。
+    中文根词若紧贴日文假名（如『天道まさえ』『お天道様』）视为日文词的一部分，不算命中。"""
+    if not root:
+        return False
+    rl = root.lower()
+    if re.search(r"[A-Za-z]", root):
+        return rl in low
+    for mt in re.finditer(re.escape(rl), low):
+        before = low[mt.start() - 1] if mt.start() > 0 else ""
+        after = low[mt.end()] if mt.end() < len(low) else ""
+        if not _KANA_RE.match(before) and not _KANA_RE.match(after):
+            return True
+    return False
+
+
+def _variant_relevant(orig_kw: str, item: dict) -> bool:
+    """变体『新增』结果相关性把关：根片名必须命中；明确异季/年代冲突则剔除。"""
+    note = item.get("note") or ""
+    low = note.lower()
+    root = _root_core(orig_kw)
+    if len(root) >= 2 and not _root_hits(root, low):
+        return False
+    _, season = _parse_season(orig_kw)
+    ts = _title_season(note)
+    if season is not None and ts is not None and ts != season:
+        return False
+    # 年份宽松：容忍 ±2 年（拍摄/首播跨年、合集区间），仅同名作品年代明显不同才拦
+    qy = [int(y) for y in _YEAR_RE.findall(orig_kw)]
+    ty = [int(y) for y in _YEAR_RE.findall(note)]
+    if qy and ty and all(abs(y - b) > 2 for y in ty for b in qy):
+        return False
+    return True
+
+
+def _mbt_url_count(mbt: dict) -> int:
+    urls = set()
+    for items in (mbt or {}).values():
+        for it in items:
+            u = (it.get("url") or "").strip()
+            if u:
+                urls.add(u)
+    return len(urls)
+
+
+def _merge_variant_mbt(extra_list: list):
+    """变体结果经相关性过滤、按 URL 去重（同链只留一条）并按域名定桶。"""
+    out, picked = {}, set()
+    for embt in extra_list:
+        for drive, items in (embt or {}).items():
+            for it in items:
+                u = (it.get("url") or "").strip()
+                if not u or u in picked:
+                    continue
+                picked.add(u)
+                d = _drive_by_url(u) or drive
+                out.setdefault(d, []).append(it)
+    return out
+
+
+async def _multi_recall(orig_kw: str):
+    """主词供给不足时并发跑变体回源，返回 (增量mbt, 变体数, 相关性过滤后新增数)。
+    自建独立 httpx client，不依赖主请求 client 的生命周期。"""
+    variants = _query_variants(orig_kw, QUERY_VARIANT_MAX)
+    if not variants:
+        return None, 0, 0
+
+    async def one(v, c):
+        try:
+            return await _internal_search(v, c)
+        except Exception:
+            return {}
+
+    results = []
+    try:
+        async with httpx.AsyncClient(
+                timeout=httpx.Timeout(QUERY_VARIANT_TIMEOUT + 10.0,
+                                      connect=10.0)) as vclient:
+            tasks = [asyncio.create_task(one(v, vclient)) for v in variants]
+            try:
+                results = await asyncio.wait_for(
+                    asyncio.gather(*tasks), timeout=QUERY_VARIANT_TIMEOUT)
+            except asyncio.TimeoutError:
+                # 硬顶到达：只收已完成的部分，未完成任务随 client 关闭而取消
+                for t in tasks:
+                    if t.done() and not t.cancelled() and not t.exception():
+                        results.append(t.result())
+    except Exception:
+        results = []
+    filtered = [{d: [it for it in items if _variant_relevant(orig_kw, it)]
+                 for d, items in (m or {}).items()} for m in results]
+    merged = _merge_variant_mbt(filtered)
+    return merged, len(variants), _mbt_url_count(merged)
+
+
 async def _search_proxy(request: Request, username: str):
     qs = dict(request.query_params)
     keyword = qs.get("kw", "")
@@ -1145,6 +1381,20 @@ async def _search_proxy(request: Request, username: str):
                     print("[portal] magnet inject error:", e)
                 # 域名复核：插件自报类型与链接域名冲突时以域名为准
                 mbt = _rebucket_by_domain(mbt)
+                # 方案一：主词供给不足时按需多路变体召回（仅 GET + 全源），合并后统一净化
+                v_count = v_added = 0
+                if (QUERY_REWRITE_ENABLED and request.method == "GET"
+                        and src in ("", "all")
+                        and _mbt_url_count(mbt) < QUERY_REWRITE_MIN_HITS):
+                    try:
+                        extra_mbt, v_count, v_added = await _multi_recall(
+                            keyword)
+                        if extra_mbt and v_added:
+                            for d, its in extra_mbt.items():
+                                mbt[d] = list(mbt.get(d, [])) + list(its)
+                    except Exception as e:
+                        print("[portal] multi recall error:", e)
+                        v_count = v_added = 0
                 # C：同版本标题指纹去重，削减模板化批量堆量的雷同链接
                 mbt, deduped = _dedup_mbt(mbt)
                 data["merged_by_type"] = mbt
@@ -1180,7 +1430,8 @@ async def _search_proxy(request: Request, username: str):
                     len(v) for v in data.get("merged_by_type", {}).values())
                 data["verified"] = {
                     "checked": len(check_urls), "removed": removed,
-                    "deduped": deduped, "source": "upstream"}
+                    "deduped": deduped, "source": "upstream",
+                    "variants": v_count, "recalled": v_added}
                 # B：首屏不等待，后台把该词剩余链接全量验证，死链下次刷新自动消失
                 deep = asyncio.create_task(
                     _bg_deep_verify(keyword, data["merged_by_type"]))

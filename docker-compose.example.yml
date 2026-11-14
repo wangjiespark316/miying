@@ -80,6 +80,11 @@ services:
       - DEDUP_ENABLED=1
       - SOURCE_HEALTH_MIN=10
       - SOURCE_HEALTH_FLOOR=0.5
+      # 方案一：查询改写/多路召回；主词唯一链接数低于阈值才触发，变体整体超时硬顶（秒）
+      - QUERY_REWRITE_ENABLED=1
+      - QUERY_VARIANT_MAX=3
+      - QUERY_REWRITE_MIN_HITS=8
+      - QUERY_VARIANT_TIMEOUT=8
       # 混合 FTS5 预索引：搜索先查本地（约百毫秒），未命中再回源，后台异步回填
       - FTS_ENABLED=1
       - FTS_FILL_INTERVAL=21600
