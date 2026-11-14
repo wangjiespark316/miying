@@ -26,6 +26,8 @@ from collections import deque
 from contextlib import contextmanager
 from datetime import datetime
 from urllib.parse import quote, urlencode, parse_qsl, urlparse
+from email.utils import formatdate as rfc822_date
+from xml.sax.saxutils import escape as xml_escape
 
 import httpx
 from fastapi import FastAPI, Request
@@ -44,7 +46,7 @@ logger = logging.getLogger("portal")
 UPSTREAM = os.environ.get("PANSOU_UPSTREAM", "http://pansou").rstrip("/")
 DB_PATH = os.environ.get("DB_PATH", "/app/data/portal.db")
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
-APP_VERSION = os.environ.get("APP_VERSION", "0.3.0")
+APP_VERSION = os.environ.get("APP_VERSION", "0.4.0")
 
 # SQLite 在线备份：启动一份 + 每日轮转，Connection.backup() 在 WAL 下也保证一致性
 BACKUP_ENABLED = bool(int(os.environ.get("BACKUP_ENABLED", "1")))
@@ -90,6 +92,10 @@ EVENT_KEEP_DAYS = int(os.environ.get("EVENT_KEEP_DAYS", "30"))
 LOGIN_WINDOW_SEC = int(os.environ.get("LOGIN_WINDOW_SEC", "900"))
 LOGIN_MAX_FAIL = int(os.environ.get("LOGIN_MAX_FAIL", "8"))
 LOGIN_LOCK_SEC = int(os.environ.get("LOGIN_LOCK_SEC", "900"))
+# 登录安全 Bark 提醒：失败达到该次数先预警一次（设 0 关闭，且应低于锁定阈值）；
+# 新公网 IP 成功登录是否提醒（内网/回环自动忽略，避免 frp 回环误报）
+LOGIN_WARN_FAIL = int(os.environ.get("LOGIN_WARN_FAIL", "3"))
+LOGIN_IP_NOTIFY = bool(int(os.environ.get("LOGIN_IP_NOTIFY", "1")))
 
 # 链接失效检测
 # A：默认同步验证窗口由 15 提到 40，并对每个网盘类型保底各验前若干条，
@@ -250,6 +256,12 @@ class Metrics:
         self.verify_unknown = 0
         self.retry_resolved = 0
         self.retry_giveup = 0
+        # 第四批：登录安全事件与 MCP 调用计数（进程期累计）
+        self.login_warn = 0
+        self.login_lock = 0
+        self.login_new_ip = 0
+        self.mcp_calls = 0
+        self.mcp_errors = 0
         self.drive_checked = {}          # 网盘类型 -> [新检测数, 死链数]
         self.jobs = {}                   # 后台任务名 -> 最近心跳
 
@@ -404,6 +416,12 @@ async def _fetch_magnets(kw: str, soft: bool = False) -> dict:
 WATCH_INTERVAL_SEC = int(os.environ.get("WATCH_INTERVAL_SEC", "7200"))
 WATCH_STARTUP_DELAY = int(os.environ.get("WATCH_STARTUP_DELAY", "90"))
 WATCH_PUSH_MAX = int(os.environ.get("WATCH_PUSH_MAX", "5"))
+# 追剧三态：want 想看 / watching 在看（参与更新监控与 Bark 推送）/ watched 看过
+WATCH_STATUSES = ("want", "watching", "watched")
+# RSS 订阅：内存短缓存防阅读器高频回源、单 feed 条目上限、无 kw 时聚合在看关键词上限
+RSS_CACHE_SEC = int(os.environ.get("RSS_CACHE_SEC", "60"))
+RSS_MAX_ITEMS = int(os.environ.get("RSS_MAX_ITEMS", "30"))
+RSS_FEED_KEYWORDS_MAX = int(os.environ.get("RSS_FEED_KEYWORDS_MAX", "5"))
 
 # 密码哈希（PBKDF2-HMAC-SHA256，每用户随机盐）
 PBKDF2_ITER = int(os.environ.get("PBKDF2_ITER", "600000"))
@@ -439,6 +457,8 @@ _last_alert = {}          # ip -> 上次告警时间
 _verify_cache = {}        # url -> (status, ts)，status: "alive" / "dead"
 _login_fails = {}         # ip -> [fail_ts, ...]
 _login_locks = {}         # ip -> lock_until_ts
+_security_alert_ts = {}   # (ip, kind) -> 上次安全提醒时间，冷却去抖
+_rss_cache: dict = {}     # (token, kw) -> (缓存时间戳, RSS XML)，短缓存防阅读器高频回源
 # A+B+C：持久化死链与来源健康度的内存视图（启动从 sqlite 预热，读路径 O(1)）
 _dead_urls: set = set()           # 已确认失效 URL，任意响应路径返回前统一过滤
 _verify_inflight: set = set()     # 后台深度验证进行中的 URL，避免跨请求重复打
@@ -522,6 +542,14 @@ def init_db():
         db.execute("""CREATE TABLE IF NOT EXISTS alerts(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ip TEXT NOT NULL, reason TEXT, detail TEXT, ts TEXT NOT NULL)""")
+        # 登录来源 IP 登记：公网新 IP 首次成功登录推送一次 Bark，已知 IP 静默累计
+        db.execute("""CREATE TABLE IF NOT EXISTS login_seen_ip(
+            ip TEXT PRIMARY KEY, first_ts TEXT NOT NULL,
+            last_ts TEXT NOT NULL, hits INTEGER DEFAULT 1)""")
+        # RSS 订阅令牌：每用户一个不可猜测 token，阅读器经 query 令牌鉴权（无法带 Bearer）
+        db.execute("""CREATE TABLE IF NOT EXISTS rss_feed(
+            username TEXT PRIMARY KEY, token TEXT UNIQUE NOT NULL,
+            created_ts TEXT NOT NULL)""")
         db.execute("""CREATE TABLE IF NOT EXISTS users(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
@@ -534,8 +562,15 @@ def init_db():
             username TEXT NOT NULL, keyword TEXT NOT NULL,
             last_ts TEXT DEFAULT '', last_total INTEGER DEFAULT 0,
             created_ts TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'watching',
             UNIQUE(username, keyword))""")
         db.execute("CREATE INDEX IF NOT EXISTS idx_watch_user ON watch(username)")
+        # 追剧三态平滑升级：旧库无 status 列时幂等补列，存量订阅默认归入"在看"
+        watch_cols = {r[1] for r in db.execute("PRAGMA table_info(watch)")}
+        if "status" not in watch_cols:
+            db.execute(
+                "ALTER TABLE watch ADD COLUMN status TEXT NOT NULL "
+                "DEFAULT 'watching'")
         db.execute("""CREATE TABLE IF NOT EXISTS poster_fallback(
             tkey TEXT PRIMARY KEY,
             qtitle TEXT DEFAULT '',
@@ -1211,6 +1246,64 @@ def push_bark(title: str, body: str, group: str = "觅影", url: str = ""):
             c.get(q)
     except Exception as e:
         logger.warning("push_bark failed: %s", e)
+
+
+def _is_private_ip(ip: str) -> bool:
+    """回环/内网地址不参与"新 IP 登录"提醒，避免 frp 回环与局域网误报。"""
+    if not ip or ip in ("unknown", "::1"):
+        return True
+    if ip.startswith(("127.", "10.", "192.168.", "169.254.")):
+        return True
+    if ip.startswith("172."):
+        try:
+            second = int(ip.split(".")[1])
+            return 16 <= second <= 31
+        except (IndexError, ValueError):
+            return False
+    return False
+
+
+def _security_notify(ip: str, kind: str, title: str, detail: str):
+    """安全事件提醒：冷却去抖 + 落审计 alerts + Bark，任何异常都不影响登录主流程。"""
+    try:
+        key = (ip, kind)
+        t = time.time()
+        if t - _security_alert_ts.get(key, 0) < ALERT_COOLDOWN_SEC:
+            return
+        _security_alert_ts[key] = t
+        with db() as conn:
+            conn.execute("INSERT INTO alerts(ip,reason,detail,ts) VALUES(?,?,?,?)",
+                         (ip, kind, detail, now_ts()))
+        push_bark(title, detail, group="觅影安全")
+    except Exception as e:
+        logger.warning("security notify failed: %s", e)
+
+
+def _note_login_seen_ip(username: str, ip: str):
+    """成功登录后登记来源 IP：公网新 IP 推送一次"新设备登录"，已知 IP 静默累计。"""
+    if not LOGIN_IP_NOTIFY or _is_private_ip(ip):
+        return
+    try:
+        with db() as conn:
+            row = conn.execute(
+                "SELECT hits FROM login_seen_ip WHERE ip=?", (ip,)).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO login_seen_ip(ip,first_ts,last_ts,hits) "
+                    "VALUES(?,?,?,1)", (ip, now_ts(), now_ts()))
+                is_new = True
+            else:
+                conn.execute(
+                    "UPDATE login_seen_ip SET last_ts=?, hits=? WHERE ip=?",
+                    (now_ts(), row["hits"] + 1, ip))
+                is_new = False
+        if is_new:
+            metrics.login_new_ip += 1
+            _security_notify(
+                ip, "login_new_ip", "觅影·新设备登录",
+                f"账号 {username} 自新 IP {ip} 登录成功，如非本人请立即改密")
+    except Exception as e:
+        logger.warning("login seen ip failed: %s", e)
 
 
 # ---------------- 透明代理（非搜索） ----------------
@@ -2522,11 +2615,21 @@ def _login_gate(ip: str):
             maybe_alert(ip, f"登录连续失败 {LOGIN_MAX_FAIL} 次，已临时锁定")
         except Exception:
             pass
+        metrics.login_lock += 1
         raise _AuthError(429, {"detail": f"失败次数过多，请 {LOGIN_LOCK_SEC} 秒后再试"})
 
 
-def _login_failed(ip: str):
+def _login_failed(ip: str, username: str = ""):
     _login_fails.setdefault(ip, []).append(time.time())
+    cut = time.time() - LOGIN_WINDOW_SEC
+    n = len([x for x in _login_fails.get(ip, []) if x > cut])
+    # 达到预警阈值（且尚未到锁定阈值）先 Bark 提醒一次；锁定由 _login_gate 另行告警
+    if 0 < LOGIN_WARN_FAIL < LOGIN_MAX_FAIL and n == LOGIN_WARN_FAIL:
+        metrics.login_warn += 1
+        who = f"账号 {username} " if username else ""
+        _security_notify(
+            ip, "login_warn", "觅影·登录失败预警",
+            f"{who}连续 {n} 次密码错误（IP {ip}），达 {LOGIN_MAX_FAIL} 次将临时锁定")
 
 
 @app.post("/portal/api/auth/login")
@@ -2543,10 +2646,11 @@ async def login(request: Request):
             and verify_password(p, row["salt"], row["pwd_hash"])):
         _login_fails.pop(ip, None)  # 登录成功，清除失败计数
         _login_locks.pop(ip, None)
+        _note_login_seen_ip(u, ip)  # 新公网 IP 首次登录 Bark 提醒
         return {"token": make_token(u), "username": u,
                 "is_admin": row["role"] == "admin",
                 "ttl_days": TOKEN_TTL_DAYS}
-    _login_failed(ip)
+    _login_failed(ip, u)
     raise _AuthError(401, {"detail": "账号或密码错误"})
 
 
@@ -2681,6 +2785,13 @@ async def admin_stats(request: Request):
         src_rows = conn.execute(
             "SELECT source,alive,dead,updated FROM source_health "
             "ORDER BY (alive+dead) DESC LIMIT 30").fetchall()
+        watch_rows = conn.execute(
+            "SELECT status,COUNT(*) c FROM watch GROUP BY status"
+        ).fetchall()
+        rss_n = conn.execute("SELECT COUNT(*) c FROM rss_feed").fetchone()["c"]
+        seen_ip_n = conn.execute(
+            "SELECT COUNT(*) c FROM login_seen_ip").fetchone()["c"]
+    ws_map = {r["status"]: r["c"] for r in watch_rows}
     f_map = {r["username"]: r["c"] for r in f_rows}
     users_out = [{
         "username": r["username"], "role": r["role"],
@@ -2735,6 +2846,16 @@ async def admin_stats(request: Request):
                     "fts_arts": fts_arts, "fts_jobs": fts_jobs,
                     "dead_links": dead_n,
                     "verify_cache": len(_verify_cache)},
+        "security": {"login_warn": metrics.login_warn,
+                     "login_lock": metrics.login_lock,
+                     "login_new_ip": metrics.login_new_ip,
+                     "known_ips": seen_ip_n},
+        "mcp": {"enabled": MCP_ENABLED,
+                "calls": metrics.mcp_calls,
+                "errors": metrics.mcp_errors},
+        "watch": {"total": sum(ws_map.values()),
+                  "by_status": {s: ws_map.get(s, 0) for s in WATCH_STATUSES},
+                  "rss_feeds": rss_n},
         "jobs": {name: {"last": jb["last"], "ok": jb["ok"], "info": jb["info"]}
                  for name, jb in metrics.jobs.items()},
     }
@@ -3118,12 +3239,25 @@ def _newest_dt(arts):
     return best
 
 
+async def _watch_baseline(kw: str):
+    """立即回源一次建立更新基线，返回 (最新资源时间, 资源总数)。失败不阻断登记。"""
+    try:
+        async with httpx.AsyncClient(
+                timeout=httpx.Timeout(60.0, connect=15.0)) as client:
+            arts = _flatten_arts(await _internal_search(kw, client))
+            if arts:
+                return _newest_dt(arts), len(arts)
+    except Exception as e:
+        logger.warning("watch baseline failed for %s: %s", kw, e)
+    return "", 0
+
+
 @app.get("/portal/api/watch")
 async def list_watch(request: Request):
     u = require_user(request)
     with db() as conn:
         rows = conn.execute(
-            "SELECT id,keyword,last_ts,last_total,created_ts FROM watch "
+            "SELECT id,keyword,last_ts,last_total,created_ts,status FROM watch "
             "WHERE username=? ORDER BY id DESC", (u,)).fetchall()
     return {"items": [dict(r) for r in rows]}
 
@@ -3137,24 +3271,37 @@ async def add_watch(request: Request):
         raise _AuthError(400, {"detail": "请填写要追的剧名"})
     if len(kw) > 40:
         raise _AuthError(400, {"detail": "剧名过长"})
+    status = (p.get("status") or "watching").strip()
+    if status not in WATCH_STATUSES:
+        raise _AuthError(400, {"detail": "未知追剧状态"})
     with db() as conn:
-        if conn.execute("SELECT id FROM watch WHERE username=? AND keyword=?",
-                        (u, kw)).fetchone():
-            raise _AuthError(400, {"detail": "已经订阅过这个剧名"})
-    # 立即搜索一次建立基线（last_ts=当前最新资源时间），避免推送旧资源
-    newest, total = "", 0
-    async with httpx.AsyncClient(
-            timeout=httpx.Timeout(60.0, connect=15.0)) as client:
-        arts = _flatten_arts(await _internal_search(kw, client))
-        if arts:
-            newest = _newest_dt(arts)
-            total = len(arts)
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO watch(username,keyword,last_ts,last_total,created_ts) "
-            "VALUES(?,?,?,?,?)",
-            (u, kw, newest, total, now_ts()))
-    return {"ok": True, "baseline": total}
+        existing = conn.execute(
+            "SELECT id,last_ts FROM watch WHERE username=? AND keyword=?",
+            (u, kw)).fetchone()
+    baseline = 0
+    if existing is None:
+        # 新建：仅"在看"立即回源建基线（避免推送旧资源）；想看/看过先登记不回源
+        newest = ""
+        if status == "watching":
+            newest, baseline = await _watch_baseline(kw)
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO watch(username,keyword,last_ts,last_total,"
+                "created_ts,status) VALUES(?,?,?,?,?,?)",
+                (u, kw, newest, baseline, now_ts(), status))
+    else:
+        # 已存在则切换状态；切到"在看"且此前无基线时补建一次
+        if status == "watching" and not existing["last_ts"]:
+            newest, baseline = await _watch_baseline(kw)
+            with db() as conn:
+                conn.execute(
+                    "UPDATE watch SET status=?,last_ts=?,last_total=? WHERE id=?",
+                    (status, newest, baseline, existing["id"]))
+        else:
+            with db() as conn:
+                conn.execute("UPDATE watch SET status=? WHERE id=?",
+                             (status, existing["id"]))
+    return {"ok": True, "baseline": baseline, "status": status}
 
 
 @app.delete("/portal/api/watch/{wid}")
@@ -3163,6 +3310,105 @@ async def del_watch(wid: int, request: Request):
     with db() as conn:
         conn.execute("DELETE FROM watch WHERE id=? AND username=?", (wid, u))
     return {"ok": True}
+
+
+# ---------------- 关键词 RSS 订阅（#244，标准库手拼 RSS 2.0，零新增依赖） ----------------
+def _build_rss_xml(channel_title: str, site_link: str, arts: list) -> str:
+    """把展平资源 [(dt,note,url,pwd,drive)] 拼成 RSS 2.0 XML，全部文本经 XML 转义。"""
+    items, seen = [], set()
+    for dt, note, url, pwd, drive in arts:
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        if len(items) >= RSS_MAX_ITEMS:
+            break
+        ep = _parse_dt(dt)
+        pub = rfc822_date(ep) if ep is not None else rfc822_date()
+        desc = f"网盘类型：{drive or '未知'}"
+        if pwd:
+            desc += f"；提取码：{pwd}"
+        items.append(
+            "<item>"
+            f"<title>{xml_escape(note or '(无标题)')}</title>"
+            f"<link>{xml_escape(url)}</link>"
+            f"<guid isPermaLink=\"true\">{xml_escape(url)}</guid>"
+            f"<pubDate>{pub}</pubDate>"
+            f"<category>{xml_escape(drive or '')}</category>"
+            f"<description>{xml_escape(desc)}</description>"
+            "</item>")
+    return (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<rss version=\"2.0\"><channel>"
+        f"<title>{xml_escape(channel_title)}</title>"
+        f"<link>{xml_escape(site_link)}</link>"
+        "<description>觅影网盘资源订阅</description>"
+        f"<lastBuildDate>{rfc822_date()}</lastBuildDate>"
+        + "".join(items) +
+        "</channel></rss>")
+
+
+@app.get("/portal/api/rss-token")
+async def get_rss_token(request: Request):
+    """登录态获取（首次自动生成）本用户不可猜测的 RSS 订阅令牌与 feed 基址。"""
+    u = require_user(request)
+    with db() as conn:
+        row = conn.execute(
+            "SELECT token FROM rss_feed WHERE username=?", (u,)).fetchone()
+        if row:
+            token = row["token"]
+        else:
+            token = secrets.token_urlsafe(24)
+            conn.execute(
+                "INSERT INTO rss_feed(username,token,created_ts) "
+                "VALUES(?,?,?)", (u, token, now_ts()))
+    return {"token": token, "feed_base": f"{str(request.base_url)}portal/rss/{token}"}
+
+
+@app.get("/portal/rss/{token}")
+async def rss_feed(token: str, request: Request):
+    """阅读器端点，query token 鉴权；带 kw 订阅单关键词，不带 kw 聚合该用户在看剧单。"""
+    with db() as conn:
+        row = conn.execute(
+            "SELECT username FROM rss_feed WHERE token=?", (token,)).fetchone()
+    if not row:
+        return Response("invalid rss token", status_code=401,
+                        media_type="text/plain; charset=utf-8")
+    u = row["username"]
+    kw = (request.query_params.get("kw") or "").strip()[:40]
+    cache_key = (token, kw)
+    hit = _rss_cache.get(cache_key)
+    if hit and time.time() - hit[0] < RSS_CACHE_SEC:
+        return Response(hit[1],
+                        media_type="application/rss+xml; charset=utf-8")
+    site_link = str(request.base_url)
+    arts, title = [], ("觅影·" + kw if kw else "觅影·追剧更新聚合")
+    try:
+        async with httpx.AsyncClient(
+                timeout=httpx.Timeout(60.0, connect=15.0)) as client:
+            if kw:
+                arts = _flatten_arts(await _internal_search(kw, client))
+            else:
+                with db() as conn:
+                    kws = [r["keyword"] for r in conn.execute(
+                        "SELECT keyword FROM watch WHERE username=? "
+                        "AND status='watching' ORDER BY id DESC LIMIT ?",
+                        (u, RSS_FEED_KEYWORDS_MAX))]
+                merged = []
+                for wkw in kws:
+                    try:
+                        merged.extend(
+                            _flatten_arts(await _internal_search(wkw, client))[:5])
+                    except Exception:
+                        continue
+                merged.sort(key=lambda a: (_parse_dt(a[0]) or 0.0), reverse=True)
+                arts = merged
+    except Exception as e:
+        logger.warning("rss fetch failed (%s): %s", title, e)
+    xml = _build_rss_xml(title, site_link, arts)
+    _rss_cache[cache_key] = (time.time(), xml)
+    if len(_rss_cache) > 128:  # 简单封顶，防止长尾令牌缓存无限增长
+        _rss_cache.clear()
+    return Response(xml, media_type="application/rss+xml; charset=utf-8")
 
 
 # ---------------- 远程 MCP（Streamable HTTP / JSON-RPC 2.0，#232） ----------------
@@ -3266,6 +3512,7 @@ async def _mcp_handle(payload):
                     timeout=httpx.Timeout(60.0, connect=15.0)) as client:
                 mbt = await _internal_search(keyword, client)
             rows = _shape_mcp_results(mbt, limit)
+            metrics.mcp_calls += 1
             result = {
                 "content": [{"type": "text", "text": json.dumps(
                     {"keyword": keyword, "count": len(rows), "results": rows},
@@ -3273,6 +3520,7 @@ async def _mcp_handle(payload):
                 "isError": False}
         except Exception as e:
             logger.warning("mcp search failed kw=%s: %s", keyword, e)
+            metrics.mcp_errors += 1
             result = {"content": [{"type": "text",
                                    "text": "搜索失败，请稍后重试"}],
                       "isError": True}
@@ -3321,7 +3569,9 @@ async def mcp_get_entry(request: Request):
 
 async def check_watches():
     with db() as conn:
-        rows = conn.execute("SELECT * FROM watch").fetchall()
+        # 仅"在看"参与更新监控与 Bark 推送；想看/看过不打扰
+        rows = conn.execute(
+            "SELECT * FROM watch WHERE status='watching'").fetchall()
     if not rows:
         return
     async with httpx.AsyncClient(

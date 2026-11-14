@@ -105,7 +105,7 @@ services:
       - BACKUP_KEEP=7
       - BACKUP_INTERVAL_SEC=86400
       # 版本号（后台可观测面板/健康探针展示）
-      - APP_VERSION=0.3.0
+      - APP_VERSION=0.4.0
       # 上游熔断：连续失败 N 次打开，冷却 M 秒后半开试探；熔断期优先本地 FTS 兜底
       - CB_FAIL_THRESHOLD=5
       - CB_OPEN_SEC=30
@@ -115,6 +115,13 @@ services:
       - VERIFY_RETRY_SCAN_SEC=60
       - VERIFY_RETRY_START_DELAY=120
       - VERIFY_RETRY_WORKERS=4
+      # 登录安全 Bark 提醒：失败 N 次先预警（0 关闭，需小于锁定阈值 8）；新公网 IP 登录是否提醒
+      - LOGIN_WARN_FAIL=3
+      - LOGIN_IP_NOTIFY=1
+      # 关键词 RSS：feed 内存缓存秒数 / 单 feed 最大条数 / 聚合 feed 最多跟踪的在看关键词数
+      - RSS_CACHE_SEC=60
+      - RSS_MAX_ITEMS=30
+      - RSS_FEED_KEYWORDS_MAX=5
     volumes:
       - ./portal-data:/app/data
     mem_limit: 192m
