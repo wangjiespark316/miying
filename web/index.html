@@ -531,6 +531,22 @@ button:focus-visible,a:focus-visible{outline:2px solid var(--gold);outline-offse
 .hot-tag .rk{font-family:var(--serif);color:var(--gold);font-weight:700;width:16px}
 .hot-tag .hc{font-size:11px;color:var(--text-3)}
 
+/* 可观测面板 */
+.obs-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(118px,1fr));gap:10px;margin-bottom:8px}
+.obs-cell{background:var(--surface);border:1px solid var(--line);border-radius:11px;padding:13px 14px}
+.obs-cell .n{font-family:var(--serif);font-size:21px;font-weight:700;color:var(--text);line-height:1}
+.obs-cell .l{font-size:11.5px;color:var(--text-3);margin-top:7px}
+.obs-ver{display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:12.5px;color:var(--text-2);margin:2px 0 14px}
+.obs-pill{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--surface);border-radius:20px;padding:5px 12px;font-size:12px;color:var(--text-2)}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block}
+.dot.ok{background:#6f9a72}.dot.bad{background:#c76b5c}.dot.wait{background:#c9a24b}
+.obs-bar{height:6px;border-radius:4px;background:var(--bg);overflow:hidden;flex:1;min-width:70px}
+.obs-bar>i{display:block;height:100%;border-radius:4px;background:var(--gold)}
+.obs-bar>i.hot{background:#c76b5c}
+.obs-drive{display:flex;align-items:center;gap:11px;font-size:12.5px;color:var(--text-2);padding:7px 2px}
+.obs-drive .nm{width:64px;flex:0 0 auto;color:var(--text)}
+.obs-drive .val{width:120px;flex:0 0 auto;text-align:right;font-variant-numeric:tabular-nums;color:var(--text-3)}
+
 /* 账号管理 */
 .um-add{display:flex;flex-wrap:wrap;gap:8px;padding:13px;background:var(--surface);border:1px solid var(--line);border-radius:12px;margin-bottom:10px}
 .um-input{flex:1;min-width:120px;background:var(--bg);border:1px solid var(--line);border-radius:9px;padding:10px 12px;font-size:13px;color:var(--text);font-family:var(--sans)}
@@ -1531,6 +1547,65 @@ function relTime(ts){
   if(diff<86400*7)return Math.floor(diff/86400)+" 天前";
   return String(ts).slice(0,10);
 }
+function fmtBytes(n){n=n||0;if(n<1024)return n+" B";if(n<1048576)return (n/1024).toFixed(1)+" KB";if(n<1073741824)return (n/1048576).toFixed(1)+" MB";return (n/1073741824).toFixed(2)+" GB";}
+function fmtUptime(sec){sec=sec||0;var d=Math.floor(sec/86400),h=Math.floor(sec%86400/3600),m=Math.floor(sec%3600/60);if(d)return d+" 天 "+h+" 小时";if(h)return h+" 小时 "+m+" 分";return m+" 分钟";}
+function agoEpoch(sec){if(!sec)return "—";var diff=(Date.now()-sec*1000)/1000;if(diff<60)return "刚刚";if(diff<3600)return Math.floor(diff/60)+" 分钟前";if(diff<86400)return Math.floor(diff/3600)+" 小时前";return Math.floor(diff/86400)+" 天前";}
+function obsCell(n,l){return '<div class="obs-cell"><div class="n">'+n+'</div><div class="l">'+l+'</div></div>';}
+function cbPill(c){var map={closed:["正常接通","ok"],open:["保护中","bad"],half_open:["试探恢复","wait"]};var x=map[c.state]||[c.state,"wait"];return '<span class="obs-pill"><span class="dot '+x[1]+'"></span>熔断 '+x[0]+(c.state==="open"?" · 已 "+c.open_for_sec+"s":"")+'</span>';}
+function renderObs(m){
+  if(!m)return "";
+  var s=m.search||{},u=m.upstream||{},v=m.verify||{},st=m.storage||{},lat=u.latency||{count:0};
+  var h='<div class="obs-ver">'+
+    '<span class="obs-pill">版本 v'+esc(m.version||"—")+'</span>'+
+    '<span class="obs-pill">已运行 '+fmtUptime(m.uptime_sec)+'</span>'+
+    cbPill(m.circuit||{state:"closed"})+'</div>';
+  h+='<div class="sec-title">上游与搜索<span class="hint">进程内计数，重启清零；持久数据看下方存储</span></div>';
+  h+='<div class="obs-grid">'+
+    obsCell(s.total||0,"累计搜索")+obsCell(s.local||0,"本地直接命中")+
+    obsCell(s.upstream||0,"回源成功")+obsCell(s.fallback||0,"熔断降级兜底")+
+    obsCell(s.variant_recalled||0,"变体召回增量")+'</div>';
+  h+='<div class="obs-ver"><span class="obs-pill">上游调用 '+u.calls+'</span>'+
+    '<span class="obs-pill">成功 '+u.ok+'</span><span class="obs-pill">失败 '+u.fail+'</span>'+
+    '<span class="obs-pill">熔断拦截 '+u.short_circuited+'</span></div>';
+  h+='<div class="obs-ver"><span class="obs-pill">延迟 '+(lat.count?("均 "+lat.avg_ms+"ms · P50 "+lat.p50_ms+"ms · P95 "+lat.p95_ms+"ms"):"暂无样本")+'</span></div>';
+  h+='<div class="sec-title">链接校验<span class="hint">仅统计本次真实新检测，缓存命中不重复计</span></div>';
+  h+='<div class="obs-grid">'+obsCell(v.checked||0,"新检测")+obsCell(v.alive||0,"存活")+
+    obsCell(v.dead||0,"失效")+obsCell(v.unknown||0,"待确认")+
+    obsCell(v.retry_pending||0,"重试队列")+obsCell(v.retry_resolved||0,"重试定性")+
+    obsCell(v.retry_giveup||0,"容错放行")+'</div>';
+  if(m.drive_health&&m.drive_health.length){
+    h+='<div class="sec-title">分网盘死链率</div>';
+    m.drive_health.forEach(function(d){
+      var pct=Math.round((d.dead_rate||0)*100);
+      h+='<div class="obs-drive"><span class="nm">'+esc(driveShort(d.drive))+'</span>'+
+        '<span class="obs-bar"><i class="'+(pct>=50?"hot":"")+'" style="width:'+Math.max(2,pct)+'%"></i></span>'+
+        '<span class="val">'+d.dead+'/'+d.checked+' · '+pct+'%</span></div>';
+    });
+  }
+  if(m.source_health&&m.source_health.length){
+    h+='<div class="sec-title">来源健康度<span class="hint">持久化累计，按资源来源</span></div>';
+    m.source_health.forEach(function(r){
+      h+='<div class="admin-row"><span class="u">'+esc(r.source||"未知")+'</span>'+
+        '<span class="s">存活 '+r.alive+' · 失效 '+r.dead+'</span>'+
+        '<span class="la">'+relTime(r.updated)+'</span></div>';
+    });
+  }
+  h+='<div class="sec-title">存储与后台任务</div>';
+  h+='<div class="obs-grid">'+obsCell(fmtBytes(st.db_bytes),"数据库")+
+    obsCell(fmtBytes(st.imgcache_bytes),"海报缓存")+obsCell(st.fts_arts||0,"FTS 条目")+
+    obsCell(st.fts_jobs||0,"FTS 作业")+obsCell(st.dead_links||0,"死链表")+
+    obsCell(st.verify_cache||0,"验证缓存")+'</div>';
+  var jobNames={backup:"数据库备份",watch:"追剧更新",fts:"本地索引",retry:"异常重试"};
+  h+='<div class="obs-ver">';
+  Object.keys(jobNames).forEach(function(name){
+    var jb=(m.jobs||{})[name];
+    if(!jb){h+='<span class="obs-pill"><span class="dot wait"></span>'+jobNames[name]+' 未启动</span>';return;}
+    h+='<span class="obs-pill"><span class="dot '+(jb.ok?"ok":"bad")+'"></span>'+jobNames[name]+
+      ' '+agoEpoch(jb.last)+(jb.info?(" · "+esc(jb.info)):"")+'</span>';
+  });
+  h+='</div>';
+  return h;
+}
 function panelEmpty(title,desc){
   return '<div class="panel-empty"><div class="pe-ic"><svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg></div><h4>'+esc(title)+'</h4><p>'+esc(desc)+'</p></div>';
 }
@@ -1710,6 +1785,7 @@ function loadAdminStats(){
         '<div class="stat-card"><div class="n">'+res.today_searches+'</div><div class="l">今日搜索</div></div>'+
         '<div class="stat-card"><div class="n">'+ips.length+'</div><div class="l">近7天访问 IP</div></div>'+
         '</div>';
+      html+=renderObs(res.meta);
       html+='<div id="umMount"></div>';
       html+='<div class="sec-title">各用户使用情况<span class="hint">（看不到收藏明细）</span></div>';
       if(!users.length)html+='<div style="'+HINT_STYLE+'">暂无数据</div>';

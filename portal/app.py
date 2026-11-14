@@ -22,6 +22,7 @@ import re
 import secrets
 import sqlite3
 import time
+from collections import deque
 from contextlib import contextmanager
 from datetime import datetime
 from urllib.parse import quote, urlencode, parse_qsl, urlparse
@@ -43,12 +44,28 @@ logger = logging.getLogger("portal")
 UPSTREAM = os.environ.get("PANSOU_UPSTREAM", "http://pansou").rstrip("/")
 DB_PATH = os.environ.get("DB_PATH", "/app/data/portal.db")
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
+APP_VERSION = os.environ.get("APP_VERSION", "0.2.0")
 
 # SQLite 在线备份：启动一份 + 每日轮转，Connection.backup() 在 WAL 下也保证一致性
 BACKUP_ENABLED = bool(int(os.environ.get("BACKUP_ENABLED", "1")))
 BACKUP_DIR = os.environ.get("BACKUP_DIR", "/app/data/backups")
 BACKUP_KEEP = int(os.environ.get("BACKUP_KEEP", "7"))
 BACKUP_INTERVAL_SEC = int(os.environ.get("BACKUP_INTERVAL_SEC", "86400"))
+
+# 上游熔断：连续失败 N 次打开闸门，打开期快速失败并优先 FTS 本地兜底，
+# 冷却后半开试探一次，避免单 worker 被多个长超时等待叠加拖死。
+CB_FAIL_THRESHOLD = int(os.environ.get("CB_FAIL_THRESHOLD", "5"))
+CB_OPEN_SEC = int(os.environ.get("CB_OPEN_SEC", "30"))
+
+# 异常链接自动重试定性：请求异常不再直接算 alive，先记 unknown，由后台每隔
+# 一段时间重试，最多 N 次仍异常才放行定性，全程内存态、不引入独立服务。
+VERIFY_RETRY_MAX = int(os.environ.get("VERIFY_RETRY_MAX", "3"))
+VERIFY_RETRY_INTERVAL_SEC = int(
+    os.environ.get("VERIFY_RETRY_INTERVAL_SEC", "180"))
+VERIFY_RETRY_SCAN_SEC = int(os.environ.get("VERIFY_RETRY_SCAN_SEC", "60"))
+VERIFY_RETRY_START_DELAY = int(
+    os.environ.get("VERIFY_RETRY_START_DELAY", "120"))
+VERIFY_RETRY_WORKERS = int(os.environ.get("VERIFY_RETRY_WORKERS", "4"))
 
 # 长效登录
 AUTH_USERS_RAW = os.environ.get("AUTH_USERS", "")
@@ -154,6 +171,114 @@ MAGNET_YTS_MAX = int(os.environ.get("MAGNET_YTS_MAX", "10"))
 _MAGNET_CACHE: dict = {}
 # fire-and-forget 后台任务强引用，防止任务被 GC 提前回收（asyncio 官方模式）
 _background_tasks: set = set()
+
+
+class CircuitBreaker:
+    """搜索上游熔断器。单 worker 事件循环内运行，普通属性即可，无需加锁。
+
+    closed 正常放行；连续失败达阈值转 open，open 期快速失败（不再等待长超时）；
+    冷却时间到转 half_open 放行一次试探，成功则闭合、失败则重新打开。"""
+
+    def __init__(self):
+        self.state = "closed"
+        self.fails = 0
+        self.opened_at = 0.0
+        self.trips = 0
+
+    def allow(self) -> bool:
+        if self.state == "closed":
+            return True
+        if self.state == "open":
+            if time.time() - self.opened_at >= CB_OPEN_SEC:
+                self.state = "half_open"
+                logger.info("upstream circuit half-open, probing once")
+                return True
+            return False
+        return True  # half_open：只放行这一次试探
+
+    def record_success(self):
+        if self.state != "closed":
+            logger.info("upstream recovered, circuit %s -> closed", self.state)
+        self.state, self.fails = "closed", 0
+
+    def record_failure(self):
+        self.fails += 1
+        if self.state == "half_open" or self.fails >= CB_FAIL_THRESHOLD:
+            if self.state != "open":
+                self.trips += 1
+                logger.warning(
+                    "upstream circuit open (consecutive fails=%s)", self.fails)
+            self.state = "open"
+            self.opened_at = time.time()
+
+    def snapshot(self) -> dict:
+        return {
+            "state": self.state, "fails": self.fails, "trips": self.trips,
+            "threshold": CB_FAIL_THRESHOLD, "open_sec": CB_OPEN_SEC,
+            "open_for_sec": round(time.time() - self.opened_at, 1)
+            if self.state == "open" else 0,
+        }
+
+
+class Metrics:
+    """进程内可观测计数（重启清零，持久化口径仍以 sqlite 为准）。"""
+
+    def __init__(self):
+        self.start_ts = time.time()
+        self.search_total = 0
+        self.search_local = 0
+        self.search_upstream = 0
+        self.search_fallback = 0
+        self.variant_recalled = 0
+        self.upstream_calls = 0
+        self.upstream_ok = 0
+        self.upstream_fail = 0
+        self.upstream_short = 0       # 熔断打开期被快速拦截、未真正发请求的次数
+        self.upstream_lat = deque(maxlen=300)
+        self.verify_checked = 0
+        self.verify_alive = 0
+        self.verify_dead = 0
+        self.verify_unknown = 0
+        self.retry_resolved = 0
+        self.retry_giveup = 0
+        self.drive_checked = {}          # 网盘类型 -> [新检测数, 死链数]
+        self.jobs = {}                   # 后台任务名 -> 最近心跳
+
+    def record_latency(self, ms: float):
+        self.upstream_lat.append(max(0.0, ms))
+
+    def latency(self) -> dict:
+        xs = sorted(self.upstream_lat)
+        if not xs:
+            return {"count": 0}
+        pick = lambda p: xs[min(len(xs) - 1, int(len(xs) * p))]
+        return {"count": len(xs),
+                "avg_ms": round(sum(xs) / len(xs)),
+                "p50_ms": round(pick(0.5)),
+                "p95_ms": round(pick(0.95)),
+                "last_ms": round(xs[-1])}
+
+    def record_verify(self, drive: str, status: str):
+        self.verify_checked += 1
+        bucket = self.drive_checked.setdefault(drive or "unknown", [0, 0])
+        bucket[0] += 1
+        if status == "dead":
+            self.verify_dead += 1
+            bucket[1] += 1
+        elif status == "unknown":
+            self.verify_unknown += 1
+        else:
+            self.verify_alive += 1
+
+    def job_beat(self, name: str, ok: bool = True, info: str = ""):
+        self.jobs[name] = {"last": time.time(), "ok": bool(ok), "info": info}
+
+
+cb = CircuitBreaker()
+metrics = Metrics()
+# 异常待重试链接：url -> [已失败次数, 下次可重试时间戳]，纯内存态
+_retry_pending: dict = {}
+_retry_inflight: set = set()
 
 
 def _magnet_item(name: str, info_hash: str, source: str,
@@ -496,13 +621,16 @@ def backup_database(tag: str = "scheduled"):
 async def backup_loop():
     """启动先备份一份，之后每隔 BACKUP_INTERVAL_SEC 备份；失败不影响主服务。"""
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, backup_database, "startup")
+    dest = await loop.run_in_executor(None, backup_database, "startup")
+    metrics.job_beat("backup", ok=bool(dest), info="startup")
     while True:
         await asyncio.sleep(BACKUP_INTERVAL_SEC)
         try:
-            await loop.run_in_executor(None, backup_database, "daily")
+            dest = await loop.run_in_executor(None, backup_database, "daily")
+            metrics.job_beat("backup", ok=bool(dest), info="daily")
         except Exception:
             logger.exception("backup loop error")
+            metrics.job_beat("backup", ok=False, info="daily error")
 
 
 def seed_users():
@@ -793,7 +921,8 @@ def _record_verdicts(verdict: dict, url_source: dict):
         return
     now = time.time()
     dead_now = [u for u, st in verdict.items() if st == "dead"]
-    alive_now = [u for u, st in verdict.items() if st != "dead"]
+    # unknown 为待重试中间态，不落库、不计来源健康度，避免污染统计与误复活
+    alive_now = [u for u, st in verdict.items() if st == "alive"]
     try:
         with db() as conn:
             for u in dead_now:
@@ -843,8 +972,9 @@ async def _check_one(url: str, client: httpx.AsyncClient):
                    [x.lower() for x in DEAD_MARKERS])
         return url, ("dead" if dead else "alive")
     except Exception:
-        # 网络异常视为未知，不隐藏（避免误杀好链接）
-        return url, "alive"
+        # 网络异常先记 unknown：本次照常展示（不误杀好链接），但不写活结论，
+        # 交给后台 retry_loop 隔几分钟重试，连续多次异常才放行定性。
+        return url, "unknown"
 
 
 async def verify_urls(urls, client: httpx.AsyncClient):
@@ -865,7 +995,12 @@ async def verify_urls(urls, client: httpx.AsyncClient):
 
         for u, status in await asyncio.gather(*[guarded(x) for x in todo]):
             verdict[u] = status
-            _verify_cache[u] = (status, now)
+            if status == "unknown":
+                # 不进长 TTL 缓存，登记后台重试（已在队列则保留既有失败计数）
+                if u not in _retry_pending:
+                    _retry_pending[u] = [1, now + VERIFY_RETRY_INTERVAL_SEC]
+            else:
+                _verify_cache[u] = (status, now)
     return verdict
 
 
@@ -907,10 +1042,103 @@ async def _bg_deep_verify(keyword: str, mbt: dict):
                     follow_redirects=True) as vclient:
                 verdict = await verify_urls(todo, vclient)
             _record_verdicts(verdict, url_source)
+            url_drive = {(it.get("url") or "").strip(): d
+                         for d, its in (mbt or {}).items() for it in its}
+            for u, st in verdict.items():
+                metrics.record_verify(url_drive.get(u, "unknown"), st)
         finally:
             _verify_inflight.difference_update(todo)
     except Exception as e:
         logger.warning("bg deep verify error kw=%s: %s", keyword, e)
+
+
+def _apply_retry_verdict(url: str, status: str):
+    """重试定性后的最小落库：维护死链集合/FTS/验证缓存。
+    重试阶段没有来源(source)上下文，故不写 source_health，避免污染来源健康度。"""
+    now = time.time()
+    try:
+        with db() as conn:
+            if status == "dead":
+                conn.execute(
+                    "INSERT INTO dead_links(url,title,ts) VALUES(?,?,?) "
+                    "ON CONFLICT(url) DO UPDATE SET ts=excluded.ts",
+                    (url, "", now))
+            else:
+                conn.execute("DELETE FROM dead_links WHERE url=?", (url,))
+        if status == "dead":
+            _dead_urls.add(url)
+            try:
+                _fts_remove_url(url)
+            except Exception:
+                pass
+        else:
+            _dead_urls.discard(url)
+        _verify_cache[url] = (status, now)
+    except Exception as e:
+        logger.warning("apply retry verdict error %s: %s", url[:80], e)
+
+
+async def retry_loop():
+    """周期性重试验证异常(unknown)链接：限流并发、隔几分钟一次，
+    连续 VERIFY_RETRY_MAX 次仍异常则容错放行 alive，全程不阻塞响应链路。"""
+    await asyncio.sleep(VERIFY_RETRY_START_DELAY)
+    metrics.job_beat("retry", info="loop started")
+    while True:
+        due = []
+        try:
+            now = time.time()
+            due = [u for u, (_, nxt) in _retry_pending.items()
+                   if nxt <= now and u not in _retry_inflight]
+            if due:
+                for u in due:
+                    _retry_inflight.add(u)
+                try:
+                    async with httpx.AsyncClient(
+                            timeout=httpx.Timeout(VERIFY_TIMEOUT + 2),
+                            follow_redirects=True) as vclient:
+                        sem = asyncio.Semaphore(VERIFY_RETRY_WORKERS)
+
+                        async def guarded(u):
+                            async with sem:
+                                return await _check_one(u, vclient)
+
+                        results = await asyncio.gather(
+                            *[guarded(u) for u in due],
+                            return_exceptions=True)
+                    for item in results:
+                        if isinstance(item, Exception):
+                            continue
+                        u, status = item
+                        _retry_inflight.discard(u)
+                        ent = _retry_pending.get(u)
+                        if status in ("alive", "dead"):
+                            _apply_retry_verdict(u, status)
+                            _retry_pending.pop(u, None)
+                            metrics.retry_resolved += 1
+                            metrics.record_verify(
+                                _drive_by_url(u) or "unknown", status)
+                            logger.info("retry resolved -> %s %s",
+                                        status, u[:80])
+                        else:
+                            fails = (ent[0] if ent else 0) + 1
+                            if fails >= VERIFY_RETRY_MAX:
+                                # 多次仍无法判定：容错放行当活，避免链接被长期挂起
+                                _apply_retry_verdict(u, "alive")
+                                _retry_pending.pop(u, None)
+                                metrics.retry_giveup += 1
+                                logger.info("retry giveup, mark alive %s",
+                                            u[:80])
+                            else:
+                                _retry_pending[u] = [
+                                    fails, now + VERIFY_RETRY_INTERVAL_SEC]
+                finally:
+                    _retry_inflight.difference_update(due)
+            metrics.job_beat("retry",
+                             info="pending=%d" % len(_retry_pending))
+        except Exception as e:
+            logger.warning("retry loop error: %s", e)
+            metrics.job_beat("retry", ok=False, info=str(e)[:120])
+        await asyncio.sleep(VERIFY_RETRY_SCAN_SEC)
 
 
 # ---------------- 滥用检测 / 告警 ----------------
@@ -1345,6 +1573,39 @@ async def _multi_recall(orig_kw: str):
     return merged, len(variants), _mbt_url_count(merged)
 
 
+class _CircuitOpen(Exception):
+    """熔断打开期间的内部快速失败信号。"""
+
+
+def _local_fallback_response(local_mbt, username, keyword, src, ip, reason):
+    """回源不可用（熔断打开/网络失败）时用本地 FTS 存量兜底，有多少给多少。
+    无任何本地存量则返回 None，由调用方回 5xx。"""
+    if not local_mbt:
+        return None
+    mbt, deduped = _dedup_mbt(local_mbt)
+    mbt, dead_hidden = _filter_dead_mbt(mbt)
+    total = sum(len(v) for v in mbt.values())
+    if not total:
+        return None
+    data = {"merged_by_type": mbt, "total": total,
+            "verified": {"checked": 0, "removed": dead_hidden,
+                         "deduped": deduped, "source": "local-fallback",
+                         "degraded": reason}}
+    _record_history(username, keyword, src, data)
+    _record_event(ip, keyword, src, data)
+    check_abuse(ip, keyword, username)
+    metrics.search_total += 1
+    metrics.search_fallback += 1
+    logger.warning("serve local fallback (%s) kw=%s total=%d",
+                   reason, keyword, total)
+    return Response(
+        content=json.dumps({"code": 0, "data": data},
+                           ensure_ascii=False).encode(),
+        status_code=200,
+        headers={"content-type": "application/json",
+                 "X-Source": "local-fallback"})
+
+
 async def _search_proxy(request: Request, username: str):
     qs = dict(request.query_params)
     keyword = qs.get("kw", "")
@@ -1354,8 +1615,9 @@ async def _search_proxy(request: Request, username: str):
     target_url, body = _inject_clean_filter(request, body)
 
     # ===== 混合检索：先查本地 FTS5，命中足够则立即返回（SWR），后台异步保鲜 =====
+    local_mbt: dict = {}
     if FTS_ENABLED and keyword and request.method == "GET":
-        local_mbt, local_total = {}, 0
+        local_total = 0
         try:
             local_mbt = _fts_local_search(keyword)
             local_total = sum(len(v) for v in local_mbt.values())
@@ -1392,6 +1654,8 @@ async def _search_proxy(request: Request, username: str):
                 _record_history(username, keyword, src, data)
             _record_event(ip, keyword, src, data)
             check_abuse(ip, keyword, username)
+            metrics.search_total += 1
+            metrics.search_local += 1
             payload = {"code": 0, "data": data}
             return Response(
                 content=json.dumps(payload, ensure_ascii=False).encode(),
@@ -1408,12 +1672,31 @@ async def _search_proxy(request: Request, username: str):
         mag_task = asyncio.create_task(_fetch_magnets(keyword))
         _background_tasks.add(mag_task)
         mag_task.add_done_callback(_background_tasks.discard)
+    # 熔断打开：不发起长等待请求，直接尝试本地 FTS 兜底，避免单 worker 被超时拖垮
+    if not cb.allow():
+        metrics.upstream_short += 1
+        fb = _local_fallback_response(local_mbt, username, keyword, src, ip,
+                                      "circuit-open")
+        if fb is not None:
+            return fb
+        return JSONResponse(
+            {"detail": "上游暂时不可用，已启用本地保护，请稍后重试"},
+            status_code=503, headers={"Retry-After": str(CB_OPEN_SEC)})
     try:
         async with httpx.AsyncClient(
                 timeout=httpx.Timeout(180.0, connect=15.0)) as client:
+            _t0 = time.time()
             upstream = await client.request(
                 request.method, target_url,
                 headers=_fwd_headers(request), content=body)
+        metrics.upstream_calls += 1
+        metrics.record_latency((time.time() - _t0) * 1000)
+        if upstream.status_code >= 500:
+            cb.record_failure()
+            metrics.upstream_fail += 1
+        else:
+            cb.record_success()
+            metrics.upstream_ok += 1
         content = upstream.content
         if upstream.status_code == 200 and keyword:
             payload = json.loads(content.decode("utf-8"))
@@ -1476,9 +1759,13 @@ async def _search_proxy(request: Request, username: str):
                             follow_redirects=True) as vclient:
                         verdict = await verify_urls(check_urls, vclient)
                     # 仅对本次新检测结果落库/累计健康度，缓存命中项不重复计数
-                    _record_verdicts(
-                        {u: verdict[u] for u in fresh_pending if u in verdict},
-                        url_source)
+                    fresh_verdict = {u: verdict[u] for u in fresh_pending
+                                     if u in verdict}
+                    _record_verdicts(fresh_verdict, url_source)
+                    url_drive = {(it.get("url") or "").strip(): d
+                                 for d, its in mbt.items() for it in its}
+                    for u, st in fresh_verdict.items():
+                        metrics.record_verify(url_drive.get(u, "unknown"), st)
                 # A+B：本次新判死链 + 历史已确认死链统一剔除（含持久化结果）
                 mbt, removed = _filter_dead_mbt(mbt)
                 data["merged_by_type"] = mbt
@@ -1488,6 +1775,10 @@ async def _search_proxy(request: Request, username: str):
                     "checked": len(check_urls), "removed": removed,
                     "deduped": deduped, "source": "upstream",
                     "variants": v_count, "recalled": v_added}
+                metrics.search_total += 1
+                metrics.search_upstream += 1
+                if v_added:
+                    metrics.variant_recalled += v_added
                 # B：首屏不等待，后台把该词剩余链接全量验证，死链下次刷新自动消失
                 deep = asyncio.create_task(
                     _bg_deep_verify(keyword, data["merged_by_type"]))
@@ -1509,6 +1800,12 @@ async def _search_proxy(request: Request, username: str):
                         headers={"content-type": ctype})
     except httpx.RequestError as e:
         logger.warning("search upstream error: %s", e)
+        cb.record_failure()
+        metrics.upstream_fail += 1
+        fb = _local_fallback_response(local_mbt, username, keyword, src, ip,
+                                      "upstream-error")
+        if fb is not None:
+            return fb
         return JSONResponse({"detail": "搜索服务暂时不可用，请稍后重试"},
                             status_code=502)
 
@@ -1526,6 +1823,8 @@ async def proxy_api(path: str, request: Request):
 @app.get("/portal/health")
 async def health():
     return {"ok": True, "service": "pansou-portal", "mode": "longtoken",
+            "version": APP_VERSION,
+            "circuit": cb.snapshot()["state"],
             "upstream": UPSTREAM}
 
 
@@ -2166,6 +2465,15 @@ async def admin_stats(request: Request):
         alerts = conn.execute(
             "SELECT ip,reason,detail,ts FROM alerts ORDER BY id DESC LIMIT 30"
         ).fetchall()
+        fts_arts = conn.execute(
+            "SELECT COUNT(*) c FROM idx_arts").fetchone()["c"]
+        fts_jobs = conn.execute(
+            "SELECT COUNT(*) c FROM idx_jobs").fetchone()["c"]
+        dead_n = conn.execute(
+            "SELECT COUNT(*) c FROM dead_links").fetchone()["c"]
+        src_rows = conn.execute(
+            "SELECT source,alive,dead,updated FROM source_health "
+            "ORDER BY (alive+dead) DESC LIMIT 30").fetchall()
     f_map = {r["username"]: r["c"] for r in f_rows}
     users_out = [{
         "username": r["username"], "role": r["role"],
@@ -2173,7 +2481,59 @@ async def admin_stats(request: Request):
         "search_count": r["searches"], "fav_count": f_map.get(r["username"], 0),
         "last_active": r["last_active"],
     } for r in u_rows]
+    def _dir_size(path):
+        total = 0
+        try:
+            for root, _, files in os.walk(path):
+                for fn in files:
+                    try:
+                        total += os.path.getsize(os.path.join(root, fn))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        return total
+
+    db_bytes = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
+    drive_health = sorted((
+        {"drive": d, "checked": c, "dead": de,
+         "dead_rate": round(de / c, 3) if c else 0.0}
+        for d, (c, de) in metrics.drive_checked.items()),
+        key=lambda x: x["checked"], reverse=True)
+    meta = {
+        "version": APP_VERSION,
+        "uptime_sec": round(time.time() - metrics.start_ts),
+        "circuit": cb.snapshot(),
+        "search": {"total": metrics.search_total,
+                   "local": metrics.search_local,
+                   "upstream": metrics.search_upstream,
+                   "fallback": metrics.search_fallback,
+                   "variant_recalled": metrics.variant_recalled},
+        "upstream": {"calls": metrics.upstream_calls,
+                     "ok": metrics.upstream_ok,
+                     "fail": metrics.upstream_fail,
+                     "short_circuited": metrics.upstream_short,
+                     "latency": metrics.latency()},
+        "verify": {"checked": metrics.verify_checked,
+                   "alive": metrics.verify_alive,
+                   "dead": metrics.verify_dead,
+                   "unknown": metrics.verify_unknown,
+                   "retry_pending": len(_retry_pending),
+                   "retry_resolved": metrics.retry_resolved,
+                   "retry_giveup": metrics.retry_giveup},
+        "drive_health": drive_health,
+        "source_health": [dict(r) for r in src_rows],
+        "storage": {"db_bytes": db_bytes,
+                    "imgcache_bytes": _dir_size(POSTER_CACHE_DIR),
+                    "fts_arts": fts_arts, "fts_jobs": fts_jobs,
+                    "dead_links": dead_n,
+                    "verify_cache": len(_verify_cache)},
+        "jobs": {name: {"last": jb["last"], "ok": jb["ok"], "info": jb["info"]}
+                 for name, jb in metrics.jobs.items()},
+    }
     return {
+        "version": APP_VERSION,
+        "meta": meta,
         "total_searches": total,
         "today_searches": today,
         "users": users_out,
@@ -2475,13 +2835,30 @@ async def _internal_search(keyword: str, client: httpx.AsyncClient):
         "filter": json.dumps({"exclude": DEFAULT_EXCLUDE}, ensure_ascii=False),
     })
     try:
+        if not cb.allow():
+            raise _CircuitOpen("circuit open")
+        _t0 = time.time()
         r = await client.get(f"{UPSTREAM}/api/search?{q}")
+        metrics.upstream_calls += 1
+        metrics.record_latency((time.time() - _t0) * 1000)
+        if r.status_code >= 500:
+            cb.record_failure()
+            metrics.upstream_fail += 1
+            return {}
+        cb.record_success()
+        metrics.upstream_ok += 1
         payload = r.json()
         if payload.get("code") != 0:
             return {}
         return _rebucket_by_domain(
             payload.get("data", {}).get("merged_by_type") or {})
+    except _CircuitOpen:
+        # 熔断打开：快速返回空，不发起请求、不占长超时（变体/追剧均容忍空结果）
+        metrics.upstream_short += 1
+        return {}
     except Exception as e:
+        cb.record_failure()
+        metrics.upstream_fail += 1
         logger.warning("internal search failed kw=%s: %s", keyword, e)
         return {}
 
@@ -2631,8 +3008,10 @@ async def watch_loop():
     while True:
         try:
             await check_watches()
+            metrics.job_beat("watch", info="ok")
         except Exception as e:
             logger.warning("watch_loop error: %s", e)
+            metrics.job_beat("watch", ok=False, info=str(e)[:120])
         await asyncio.sleep(WATCH_INTERVAL_SEC)
 
 
@@ -2776,8 +3155,10 @@ async def fts_loop():
     while True:
         try:
             await _fts_fill()
+            metrics.job_beat("fts", info="fill")
         except Exception as e:
             logger.warning("fts_loop error: %s", e)
+            metrics.job_beat("fts", ok=False, info=str(e)[:120])
         await asyncio.sleep(FTS_FILL_INTERVAL)
 
 
@@ -2785,5 +3166,6 @@ async def fts_loop():
 async def _start_watch():
     asyncio.create_task(backup_loop())
     asyncio.create_task(watch_loop())
+    asyncio.create_task(retry_loop())
     if FTS_ENABLED:
         asyncio.create_task(fts_loop())
