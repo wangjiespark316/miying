@@ -919,6 +919,26 @@ var fbMap={};        // 片名 -> 封面URL（本次会话缓存；空串=已确
 var fbQueue={};      // 片名 -> 海报容器数组
 var fbTimer=null;
 var fbInflight=false;
+var fbSettleTimer=null;
+/* 第九批：锚定是否仍在途（请求中 / 队列有待拉片名 / 防抖 timer 未触发）。
+   分类页计数依赖异步到达的作品锚，忙碌期冻结，drain 后定格，避免 13→8→4 反复跳。 */
+function anchorWorking(){
+  return fbInflight||Object.keys(fbQueue).length>0||!!fbTimer;
+}
+/* 队列彻底排空后短延时单飞确认，再无条件重渲一次，让分类计数/各源角标按最终锚定格。
+   不分 grouped：非聚合态切源等触发的重渲同样依赖已到齐的 metaMap。 */
+function fbSettleSchedule(){
+  if(fbSettleTimer)clearTimeout(fbSettleTimer);
+  fbSettleTimer=setTimeout(function(){
+    fbSettleTimer=null;
+    if(anchorWorking()){fbSettleSchedule();return;}
+    var rs=document.getElementById("resultSection");
+    if(rs&&!rs.classList.contains("hidden")&&state.byType){
+      renderTabs();
+      renderResults();
+    }
+  },320);
+}
 function fbEnqueue(note,box){
   note=(note||"").trim();
   if(!note||!box)return;
@@ -980,9 +1000,11 @@ function fbFlush(){
   if(!titles.length||fbInflight)return;
   var batch=titles.slice(0,24);
   fbInflight=true;
+  fbTimer=null;
   function done(){
     fbInflight=false;
-    if(Object.keys(fbQueue).length)fbTimer=setTimeout(fbFlush,500);
+    if(Object.keys(fbQueue).length){fbTimer=setTimeout(fbFlush,500);}
+    else {fbTimer=null;fbSettleSchedule();}
   }
   api("/portal/api/poster-fallback",{method:"POST",body:JSON.stringify({titles:batch})})
     .then(function(r){return r.json();})
@@ -1358,6 +1380,7 @@ function doSearch(){
   if(!kw)return;
   if(_searching)return;
   _searching=true;
+  if(fbSettleTimer){clearTimeout(fbSettleTimer);fbSettleTimer=null;}
   /* 新搜索重置画质筛选为「全部」，避免上一次的画质/网盘选择被带进新搜索导致空结果 */
   state.quality="all";
   /* T5：类型入口（电影/剧集/动漫/纪录片）按搜索词映射 genre 真过滤；普通词为 null 不过滤 */
@@ -1423,6 +1446,13 @@ function processData(merged){
     vf.style.display="";
   }else{vf.textContent="";vf.style.display="none";}
   renderTabs();
+  /* 第九批：一次性预热「所有网盘来源」的作品锚（现状仅预热当前 tab，切源会二次跳数）。
+     fbPrefetch 内部按 fbMap/fbQueue 去重，后台拉齐全部 meta，切源时计数即已稳定。 */
+  var allNotes=[];
+  availableTypes().forEach(function(t){
+    (state.byType[t]||[]).forEach(function(it){allNotes.push(it.note);});
+  });
+  fbPrefetch(allNotes);
   if(state.total===0){
     document.getElementById("resultSection").classList.add("hidden");
     document.getElementById("emptyState").classList.remove("hidden");
@@ -1447,7 +1477,9 @@ function renderTabs(){
   availableTypes().forEach(function(t){
     var b=document.createElement("button");
     b.className="tab"+(t===state.currentType?" active":"");
-    b.innerHTML=driveShort(t)+'<span class="num">'+genreRowsOf(state.byType[t]||[]).length+'</span>';
+    /* 分类锚定在途时各源角标同样冻结，避免与标题计数一起跳动；drain 后统一刷新定格 */
+    var tabNum=(state.genreFilter&&anchorWorking())?"…":genreRowsOf(state.byType[t]||[]).length;
+    b.innerHTML=driveShort(t)+'<span class="num">'+tabNum+'</span>';
     b.addEventListener("click",function(){selectType(t);});
     tabs.appendChild(b);
   });
@@ -1761,14 +1793,27 @@ function renderResults(){
   var rows=applyQuality(baseRows);
   /* 标题计数反映 genre 真过滤 + 画质筛选后的条数；任一过滤生效则附原始总数 */
   var rtEl=document.getElementById("rTotal"),tailEl=document.getElementById("rTotalTail");
+  /* 分类页计数依赖异步作品锚：锚定在途时冻结为「…锚定中」，drain 后由 fbSettleSchedule 定格，
+     普通词（无 genreFilter）条数不依赖锚，始终显示实时值，不受冻结影响。 */
+  var busy=!!state.genreFilter&&anchorWorking();
   var filtered=state.quality!=="all"||baseRows.length<rawAll.length;
-  if(rtEl)rtEl.textContent=filtered?rows.length:baseRows.length;
-  if(tailEl)tailEl.textContent=filtered?" 条（共 "+rawAll.length+" 条）":" 条资源";
+  if(rtEl)rtEl.textContent=busy?"…":(filtered?rows.length:baseRows.length);
+  if(tailEl)tailEl.textContent=busy?" 锚定中，计数稍后定格":(filtered?" 条（共 "+rawAll.length+" 条）":" 条资源");
   box.innerHTML="";
   if(!rows.length){
     var empty=document.createElement("div");
     empty.className="panel-empty";empty.style.padding="40px 0";
-    empty.innerHTML='<h4>该筛选下暂无资源</h4><p>换一个画质/类型筛选，或切到「全部」查看全部 '+rawAll.length+' 条</p>';
+    var emptyMsg;
+    if(busy){
+      emptyMsg='<h4>正在匹配作品类型…</h4><p>作品锚分批到达中，计数稳定后自动定格</p>';
+    }else if(rawAll.length===0){
+      /* 当前网盘来源本就 0 条：指引切上方真实存在的「来源标签」，不再误指画质「全部」 */
+      emptyMsg='<h4>这个网盘来源下暂无资源</h4><p>切到上方其它网盘来源标签看看，全部来源共 '+state.total+' 条</p>';
+    }else{
+      /* 来源有数据、是画质/类型筛空：「全部」确为画质筛选按钮，此指引才成立 */
+      emptyMsg='<h4>该筛选下暂无资源</h4><p>换一个画质或类型筛选，或把画质切到「全部」查看这 '+rawAll.length+' 条</p>';
+    }
+    empty.innerHTML=emptyMsg;
     box.appendChild(empty);renderFilterBar();return;
   }
   var container=document.createElement("div");

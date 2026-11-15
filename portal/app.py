@@ -47,7 +47,7 @@ logger = logging.getLogger("portal")
 UPSTREAM = os.environ.get("PANSOU_UPSTREAM", "http://pansou").rstrip("/")
 DB_PATH = os.environ.get("DB_PATH", "/app/data/portal.db")
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
-APP_VERSION = os.environ.get("APP_VERSION", "0.5.4")
+APP_VERSION = os.environ.get("APP_VERSION", "0.5.5")
 
 # SQLite 在线备份：启动一份 + 每日轮转，Connection.backup() 在 WAL 下也保证一致性
 BACKUP_ENABLED = bool(int(os.environ.get("BACKUP_ENABLED", "1")))
@@ -2588,6 +2588,95 @@ _FB_DROP_WORDS = ["两季全", "两季", "全季", "合集", "高清", "超清",
                   "日剧", "港剧", "台剧", "动漫", "综艺", "电影", "电视剧"]
 
 
+# ===== 第九批：不依赖被风控 /search 的本地锚定（orig 反查 + 四分类种子 /subject 预热） =====
+# 背景：rexxar /search 对部分出口 IP 持续 403，而 /subject/{sid} 稳定 200。下列种子 sid 均
+# 已经 /subject 200 逐个核验；name 取 subject.title，aka 给无季名/译名/原名做 root 精确桥接。
+# 这是后端可维护常量、不写死前端；真实 kind/genres/cover/orig 一律以 subject 拉取结果为准。
+_FB_SEED_ANCHORS = [
+    # —— 电影 movie ——
+    {"sid": "3001114", "name": "沙丘", "aka": ["Dune"]},
+    {"sid": "35575567", "name": "沙丘2",
+     "aka": ["Dune Part Two", "Dune: Part Two", "沙丘 2"]},
+    {"sid": "35593344", "name": "奥本海默", "aka": ["Oppenheimer"]},
+    # —— 剧集 tv ——
+    {"sid": "25853071", "name": "庆余年 第一季",
+     "aka": ["庆余年", "庆余年第一季"]},
+    {"sid": "35465232", "name": "狂飙", "aka": []},
+    {"sid": "4922787", "name": "后宫·甄嬛传",
+     "aka": ["甄嬛传", "Empresses in the Palace"]},
+    # —— 动漫 tv（genres 含动画）——
+    {"sid": "1453238", "name": "海贼王",
+     "aka": ["航海王", "ONE PIECE", "ワンピース"]},
+    {"sid": "30210221", "name": "鬼灭之刃",
+     "aka": ["鬼滅の刃", "Demon Slayer", "Demon Slayer Kimetsu no Yaiba"]},
+    # —— 纪录片 tv（genres 含纪录片）——
+    {"sid": "26694967", "name": "航拍中国 第一季",
+     "aka": ["航拍中国", "航拍中国第一季"]},
+    {"sid": "35633931", "name": "千古风流人物 第一季",
+     "aka": ["千古风流人物", "千古风流人物第一季"]},
+    {"sid": "1871906", "name": "地球脉动 第一季",
+     "aka": ["地球脉动", "地球脉动第一季", "Planet Earth", "Planet Earth Season 1"]},
+    {"sid": "26733371", "name": "地球脉动 第二季",
+     "aka": ["地球脉动第二季", "Planet Earth II", "Planet Earth Season 2"]},
+]
+
+# 名称归一：小写、剥离"第X季/第X部"与空白/间隔/连接/标点，让无季 root（航拍中国）能命中
+# 带季规范名（航拍中国 第一季），这是锚已在库却被分类回退滤除的实测根因。
+_FB_NAME_PUNCT = re.compile(r"[\s·・:：\-_/\\,，.。!！?？'\"‘’“”()（）\[\]{}]+")
+_FB_SEASON_TAIL = re.compile(r"第[0-9一二两三四五六七八九十]+[季部]")
+
+
+def _fb_name_norm(s: str) -> str:
+    s = (s or "").lower()
+    s = _FB_SEASON_TAIL.sub("", s)
+    return _FB_NAME_PUNCT.sub("", s)
+
+
+# 拉丁 token 化：只保留字母实词，去年份（数字本就不匹配 [a-z]+）、画质编码技术词与虚词。
+_FB_LATIN_STOP = {
+    "the", "a", "an", "all", "of", "and", "or", "to", "in", "on", "for", "with",
+    "at", "by", "le", "la", "el", "il", "is", "it", "its", "be", "de", "du",
+    "des", "un", "une", "das", "die", "der", "den", "del", "los", "las",
+}
+_FB_LATIN_TECH = {
+    "uhd", "hdr", "remux", "webdl", "web", "dl", "bluray", "dolby", "atmos",
+    "truehd", "dts", "hevc", "x264", "x265", "h264", "h265", "aac", "ac3",
+    "nf", "dsnp", "gb", "mb", "bit", "version", "vol", "complete", "edition",
+    "uncut", "remastered", "proper", "repack", "hd", "bd", "imax",
+}
+_FB_LATIN_WORD = re.compile(r"[a-z]+")
+
+
+def _fb_latin_tokens(s: str):
+    out = []
+    for w in _FB_LATIN_WORD.findall((s or "").lower()):
+        if len(w) < 2 or w in _FB_LATIN_STOP or w in _FB_LATIN_TECH:
+            continue
+        out.append(w)
+    return out
+
+
+def _fb_sublist(needle, hay) -> bool:
+    n = len(needle)
+    if n == 0:
+        return False
+    for i in range(0, len(hay) - n + 1):
+        if hay[i:i + n] == needle:
+            return True
+    return False
+
+
+def _fb_latin_match(anchor_tokens, q_tokens) -> bool:
+    """保守命中规则（序号强约束由调用方先行处理）：
+    单实词锚（oppenheimer）要求查询过滤后全等，排除《To End All War Oppenheimer…》等同名异作；
+    多实词锚（dune+part+two）要求其序列在查询拉丁序列中作连续片段出现，覆盖西语前缀变体。"""
+    if not anchor_tokens or not q_tokens:
+        return False
+    if len(anchor_tokens) == 1:
+        return q_tokens == anchor_tokens
+    return _fb_sublist(anchor_tokens, q_tokens) or q_tokens == anchor_tokens
+
+
 def _season_cn(sm):
     n = int(sm.group(1))
     cn = {1: "一", 2: "二", 3: "三", 4: "四", 5: "五", 6: "六",
@@ -2974,6 +3063,205 @@ def _fb_cache_set(tkey: str, q: str, info, soft=False):
         pass
 
 
+# ---- 第九批本地锚定运行态：种子 subject 预热 + 库内 orig/title 零 HTTP 反查 ----
+_FB_SEED_LOCK = asyncio.Lock()
+_FB_SEED_WARMED = set()     # 本进程已成功预热落锚的 sid
+_FB_SEED_FETCHING = set()   # 正在按需拉取 subject 的 sid，防并发重复请求
+_FB_SID_INDEX = None        # 库内全部带 sid 且有封面锚的快照（list[dict]），懒加载
+
+
+async def _fb_fetch_subject(sid: str, client):
+    """只走稳定的 /subject/{sid}（不碰被风控的 /search），返回与 poster_fallback 同构 info；
+    非 200/异常/无封面一律返回 None，由调用方按 miss 处理，绝不伪造。"""
+    sid = str(sid or "").strip()
+    if not sid:
+        return None
+    try:
+        r = await client.get(REXXAR_BASE + "/subject/" + sid, headers=REXXAR_HEADERS)
+        if r.status_code != 200:
+            return None
+        d = r.json()
+    except Exception:
+        return None
+    cover = _normalize_douban_cover_url(d.get("cover_url") or "")
+    if not cover:
+        return None
+    rv = d.get("rating") or {}
+    rate = ""
+    if isinstance(rv, dict) and rv.get("value") is not None:
+        v = rv["value"]
+        rate = ("%g" % v) if isinstance(v, (int, float)) else str(v)
+    title = (d.get("title") or "").strip()
+    ot = (d.get("original_title") or "").strip()
+    kind = (d.get("type") or "").strip().lower()
+    if kind not in ("movie", "tv"):
+        kind = "tv" if d.get("is_tv") else kind
+    g = d.get("genres")
+    if isinstance(g, list):
+        genres = ",".join(str(x).strip() for x in g if str(x).strip())
+    else:
+        genres = (g or "") if isinstance(g, str) else ""
+    return {"cover": cover, "title": title, "year": str(d.get("year") or ""),
+            "rating": rate, "sid": sid, "genres": genres, "kind": kind,
+            "orig": (ot if ot and ot != title else "")}
+
+
+def _fb_anchor_complete(info: dict) -> bool:
+    """完整锚：有封面且 subject 可提供的核心元数据 year/genres 都在。
+    历史 /search 落锚可能只有 cover/sid/kind 而缺 year/genres，视为残缺需 subject 补全。"""
+    info = info or {}
+    return bool(info.get("cover") and info.get("year") and info.get("genres"))
+
+
+def _fb_load_sid_index(force: bool = False):
+    """载入库内全部带 sid 且有封面的锚（含种子预热与历史 search 落锚），供零 HTTP 反查。
+    同一 sid 可能残留历史残缺行与 subject 补全后的完整行，按 sid 归并、完整行优先。"""
+    global _FB_SID_INDEX
+    if _FB_SID_INDEX is not None and not force:
+        return _FB_SID_INDEX
+    try:
+        with db() as conn:
+            rows = conn.execute(
+                "SELECT cover,title,year,rating,sid,genres,kind,orig FROM poster_fallback "
+                "WHERE sid IS NOT NULL AND sid<>'' AND cover IS NOT NULL AND cover<>''"
+            ).fetchall()
+    except Exception:
+        rows = []
+    best = {}
+    for r in rows:
+        info = dict(r)
+        sid = str(info.get("sid", ""))
+        if not sid:
+            continue
+        row = {
+            "info": info, "sid": sid,
+            "name_n": _fb_name_norm(info.get("title", "")),
+            "lat": _fb_latin_tokens(info.get("orig", "")),
+            "seq": _fb_seq(info.get("orig", "") or info.get("title", "")),
+        }
+        prev = best.get(sid)
+        if prev is None or (not _fb_anchor_complete(prev["info"])
+                            and _fb_anchor_complete(info)):
+            best[sid] = row
+    _FB_SID_INDEX = list(best.values())
+    return _FB_SID_INDEX
+
+
+def _fb_seed_norm_keys(seed: dict):
+    keys = {_fb_name_norm(seed.get("name", ""))}
+    for a in seed.get("aka", []):
+        keys.add(_fb_name_norm(a))
+    return {k for k in keys if k}
+
+
+def _fb_eff_seq(q: str, root: str):
+    """续作/季序号的有效口径。中文根片名信任 _fb_root 已剥掉演员/版本/画质后缀的 root
+    （如 '102.奥本海默…BluRay.2' 结尾裸 2 是版本噪声，root='奥本海默' 无序号，不得当续作）；
+    拉丁 root 仍取完整 q 序号，确保 'Dune Part Two' 不会回首作 Dune。"""
+    if re.search(r"[一-鿿]", root or ""):
+        return _fb_seq(root)
+    return _fb_seq(q or root)
+
+
+def _fb_seed_match(q: str, root: str):
+    """级1（1b）：种子规范名/别名（含去季号归一）与 root 主体精确桥接，返回 seed 或 None。
+    不在整个 q 任意位置含中文名就并，杜绝《终结一切战争 奥本海默…》式同名异作误并。"""
+    rn = _fb_name_norm(root)
+    rq = _fb_name_norm(q)
+    rseq = _fb_eff_seq(q, root)
+    for seed in _FB_SEED_ANCHORS:
+        if rn not in _fb_seed_norm_keys(seed) and rq not in _fb_seed_norm_keys(seed):
+            continue
+        sseq = _fb_seq(seed.get("name", ""))
+        # 查询带明确续作/季序号时，种子序号必须相等，防止"地球脉动 第二季"落到第一季
+        if rseq is not None and rseq >= 2 and sseq != rseq:
+            continue
+        return seed
+    return None
+
+
+def _fb_orig_match(q: str, root: str = ""):
+    """级2（1a）：库内已锚 orig 拉丁名反向匹配，纯本地零 HTTP，返回 info 或 None。
+    多锚同时命中不同 sid 时放弃（返回 None），宁缺毋滥防误并。"""
+    qt = _fb_latin_tokens(q)
+    if not qt:
+        return None
+    qseq = _fb_eff_seq(q, root or "")
+    hits = []
+    for row in _fb_load_sid_index():
+        at = row["lat"]
+        if not at:
+            continue
+        aseq = row["seq"]
+        if qseq is not None and qseq >= 2:
+            if aseq != qseq:          # 续作查询只接受同序号锚，首作 Dune 排除
+                continue
+        elif aseq is not None and aseq >= 2 and len(at) < 2:
+            # 无序号查询不落到"单词续作锚"；多词锚（如 Dune/Part/Two 连续片段）本身已
+            # 自证续作语义、且单词首作锚不可能全等命中，故放行交给拉丁匹配裁决。
+            continue
+        if _fb_latin_match(at, qt):
+            hits.append(row)
+    if len({h["sid"] for h in hits}) != 1:
+        return None
+    return hits[0]["info"]
+
+
+async def _fb_resolve_local(q: str, root: str, client):
+    """不依赖 /search 的本地锚定入口：先种子桥接（库内复用，缺失才稳定 subject 拉取），
+    再库内 orig 拉丁反查。返回 info 或 None；不在此写当前 tkey，由调用方统一落缓存。"""
+    seed = _fb_seed_match(q, root)
+    if seed:
+        sid = str(seed["sid"])
+        existing = next((r for r in _fb_load_sid_index() if r["sid"] == sid), None)
+        # 库内已是完整锚直接零 HTTP 复用；历史残缺锚（缺 year/genres）则用 subject 补全
+        if existing is not None and _fb_anchor_complete(existing["info"]):
+            return existing["info"]
+        if sid not in _FB_SEED_FETCHING:
+            _FB_SEED_FETCHING.add(sid)
+            try:
+                info = await _fb_fetch_subject(sid, client)
+                if info and info.get("cover"):
+                    _fb_cache_set(_fb_key(seed["name"]), seed["name"], info)
+                    _fb_load_sid_index(force=True)
+                    _FB_SEED_WARMED.add(sid)
+                    return info
+            finally:
+                _FB_SEED_FETCHING.discard(sid)
+        # subject 暂不可用时降级返回历史残缺锚（至少有 cover/kind），不阻断渲染
+        return existing["info"] if existing is not None else None
+    return _fb_orig_match(q, root)
+
+
+async def _fb_seed_warmup():
+    """启动后台单飞预热：逐个种子走 /subject 落同构锚，低速、容错、失败静默、不阻塞服务。"""
+    async with _FB_SEED_LOCK:
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=6.0)) as client:
+                rows = _fb_load_sid_index(force=True)
+                complete = {r["sid"] for r in rows if _fb_anchor_complete(r["info"])}
+                for seed in _FB_SEED_ANCHORS:
+                    sid = str(seed["sid"])
+                    # 已有完整锚跳过；历史残缺锚（有 cover 缺 year/genres）重新拉 subject 补全
+                    if sid in complete or sid in _FB_SEED_WARMED:
+                        continue
+                    info = await _fb_fetch_subject(sid, client)
+                    if info and info.get("cover"):
+                        _fb_cache_set(_fb_key(seed["name"]), seed["name"], info)
+                        _FB_SEED_WARMED.add(sid)
+                    await asyncio.sleep(_FB_REQ_GAP)
+                _fb_load_sid_index(force=True)
+        except Exception as e:
+            logger.warning("fb seed warmup partial: %s", e)
+
+
+async def _fb_seed_warmup_safe():
+    try:
+        await _fb_seed_warmup()
+    except Exception:
+        pass
+
+
 @app.post("/portal/api/poster-fallback")
 async def poster_fallback(request: Request):
     """批量按片名补全豆瓣封面。入参 {"titles":[资源标题,...]}，出参 {"covers":{原标题:封面URL}}。"""
@@ -3046,6 +3334,14 @@ async def poster_fallback(request: Request):
             if seq0 is None:
                 seq0 = _fb_seq(root)
             cached = _fb_cache_get(tkey)
+            # 第九批：/search 持续风控时先走零 HTTP 本地锚定（种子名桥接 + 库内 orig 拉丁
+            # 反查），命中即按当前 tkey 落缓存并跳过 ask 省预算；本地无果再回退原三级 /search，
+            # 既有软/硬 miss（cached 非 None 但无 cover）同样允许被本地锚挽救。
+            if not (cached and cached.get("cover")):
+                local_info = await _fb_resolve_local(q, root, client)
+                if local_info and local_info.get("cover"):
+                    _fb_cache_set(tkey, root, local_info)
+                    cached = _fb_cache_get(tkey)
             if cached is None:
                 info = None
                 # 1) 完整清洗词（含副标题，如"蜘蛛侠 纵横宇宙"），精准优先
@@ -4474,3 +4770,5 @@ async def _start_watch():
     asyncio.create_task(retry_loop())
     if FTS_ENABLED:
         asyncio.create_task(fts_loop())
+    # 第九批：四分类种子锚后台预热（只走稳定 /subject，低速容错、不阻塞启动）
+    asyncio.create_task(_fb_seed_warmup_safe())
