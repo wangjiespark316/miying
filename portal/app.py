@@ -47,7 +47,7 @@ logger = logging.getLogger("portal")
 UPSTREAM = os.environ.get("PANSOU_UPSTREAM", "http://pansou").rstrip("/")
 DB_PATH = os.environ.get("DB_PATH", "/app/data/portal.db")
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
-APP_VERSION = os.environ.get("APP_VERSION", "0.5.2")
+APP_VERSION = os.environ.get("APP_VERSION", "0.5.3")
 
 # SQLite 在线备份：启动一份 + 每日轮转，Connection.backup() 在 WAL 下也保证一致性
 BACKUP_ENABLED = bool(int(os.environ.get("BACKUP_ENABLED", "1")))
@@ -204,6 +204,10 @@ FTS_QUERY_LIMIT = int(os.environ.get("FTS_QUERY_LIMIT", "120"))              # �
 # FTS 缓存代际：选行/配额规则变更时 +1，启动即一次性作废旧快照，令各词下次搜索
 # miss 回源按新规则重建（仅清 FTS 三表，dead_links/source_health/history 不受影响）
 FTS_CACHE_GEN = 2
+# 海报兜底匹配规则代际：续作序号（沙丘2/第N部/Part N）挑选逻辑升级后 +1，启动即一次性
+# 作废 poster_fallback 持久缓存（命中 TTL 90 天），令误串首作的封面/year/rating 下次重建。
+# gen2：修复降级查询（root/bare 剥掉季/部后）序号约束丢失导致的汉字季/部续作串首作。
+POSTER_FB_GEN = 2
 # 热搜/热榜覆盖不到的固定常用词（热门 / 经典画质标杆，与 warm-cache 对齐）
 FTS_STATIC_WORDS = ["沙丘2", "阿凡达", "让子弹飞", "奥本海默", "流浪地球2",
                     "满江红", "封神第一部", "年会不能停", "热辣滚烫",
@@ -739,6 +743,26 @@ def init_db():
             logger.info(
                 "fts cache gen %s->%s: dropped %s cached arts; "
                 "rebuild on next search", cur_gen, FTS_CACHE_GEN, dropped)
+        # 海报兜底匹配代际闸门：续作序号挑选升级后一次性作废旧 poster_fallback 持久缓存
+        # （含误串到首作的 cover/year/rating，该表命中 TTL 长达 90 天），下次搜索按新规则
+        # 重建；进程内 _FB_MEM 随重启自然清空。幂等，已处于当前代际则不再删除。
+        prow = db.execute(
+            "SELECT value FROM app_meta WHERE key='poster_fb_gen'").fetchone()
+        try:
+            pcur = int(prow[0]) if prow and prow[0] not in (None, "") else 0
+        except (TypeError, ValueError):
+            pcur = 0
+        if pcur < POSTER_FB_GEN:
+            pf_dropped = db.execute(
+                "SELECT COUNT(*) FROM poster_fallback").fetchone()[0]
+            db.execute("DELETE FROM poster_fallback")
+            db.execute(
+                "INSERT INTO app_meta(key,value) VALUES('poster_fb_gen',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(POSTER_FB_GEN),))
+            logger.info(
+                "poster fallback gen %s->%s: dropped %s cached covers; "
+                "rebuild on next search", pcur, POSTER_FB_GEN, pf_dropped)
     try:
         os.chmod(DB_PATH, 0o600)
     except OSError:
@@ -2527,6 +2551,7 @@ _FB_MAX_BATCH = 24           # 单次最多处理片名数
 _FB_REQ_GAP = 0.8            # 豆瓣请求间隔（suggest 限流敏感）
 _FB_BACKOFF_GAP = 2.2        # 一次调用内连续空结果（疑似限流）时的退避间隔
 _FB_HTTP_BUDGET = 14         # 单次调用最多发起的豆瓣 HTTP 请求数（按 root 分组后通常远低于此）
+# 注：海报兜底代际常量 POSTER_FB_GEN 定义在顶部 FTS_CACHE_GEN 旁（须早于模块加载期 init_db）
 
 # 出现即截断的"技术参数"词（这些词之后基本是画质/集数/编码，不再是片名）
 _FB_CUT_PATTERNS = [
@@ -2615,7 +2640,7 @@ def _fb_root(q: str):
     if not s:
         return ""
     head = re.split(r"[\s\-]+", s, 1)[0]
-    m = re.search(r"第[一二三四五六七八九十百\d]{1,3}季", s)
+    m = re.search(r"第[一二三四五六七八九十百\d]{1,3}[季部]", s)
     if m and m.group(0) not in head:
         head = head + " " + m.group(0)
     return head or s
@@ -2624,21 +2649,83 @@ def _fb_root(q: str):
 def _fb_root_is_short(root: str):
     """去掉季信息后的根片名长度 2~8：干净短片名 suggest 通常有结果，
     这种查询空了更可能是限流，走软 miss 快速重试。"""
-    core = re.sub(r"第[一二三四五六七八九十百\d]{1,3}季", "", root).strip()
+    core = re.sub(r"第[一二三四五六七八九十百\d]{1,3}[季部]", "", root).strip()
     return 2 <= len(core) <= 8
 
 
 def _fb_norm_title(t: str):
     """归一化标题用于相似度比较：去空格、去'第X季/季'。"""
     t = (t or "").replace(" ", "")
-    t = re.sub(r"第[一二三四五六七八九十百\d]+季", "", t)
+    t = re.sub(r"第[一二三四五六七八九十百\d]+[季部]", "", t)
     t = t.replace("季", "")
+    t = t.replace("部", "")
     return t
 
 
-def _fb_pick(arr, q: str, year: str):
-    """从豆瓣 suggest 结果里挑最匹配的一条。"""
+_FB_CN_NUM = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+              "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+_FB_PART_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+                  "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+_FB_ROMAN = {"ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6, "vii": 7,
+             "viii": 8, "ix": 9, "x": 10, "xi": 11}
+
+
+def _fb_cn_num(s: str):
+    """中文/阿拉伯数字转 int，支持'十、十一、二十'等简单续集序号；无法识别返回 None。"""
+    s = (s or "").strip()
+    if s.isdigit():
+        return int(s)
+    if "十" in s:
+        a, _, b = s.partition("十")
+        tens = _FB_CN_NUM.get(a, 1) if a else 1
+        ones = _FB_CN_NUM.get(b, 0) if b else 0
+        return tens * 10 + ones
+    return _FB_CN_NUM.get(s)
+
+
+def _fb_seq(title: str):
+    """识别作品续作序号（第N部/季、Part N、结尾裸数字、独立罗马数字），返回 int；
+    首部或无法判断返回 None。用于在片名相似之外区分同名系列，避免'沙丘2'匹配回首作。"""
+    raw = (title or "").strip().lower()
+    t = re.sub(r"\s+", "", raw)
+    if not t:
+        return None
+    m = re.search(r"第([0-9]+|[一二两三四五六七八九十]+)[部季]", t)
+    if m:
+        n = _fb_cn_num(m.group(1))
+        if n:
+            return n
+    m = re.search(
+        r"part([0-9]+|one|two|three|four|five|six|seven|eight|nine|ten|"
+        r"viii|vii|vi|iii|ix|iv|xi|ii|x|v)", t)
+    if m:
+        w = m.group(1)
+        if w.isdigit():
+            return int(w)
+        if w in _FB_PART_WORDS:
+            return _FB_PART_WORDS[w]
+        if w in _FB_ROMAN:
+            return _FB_ROMAN[w]
+    m = re.search(r"([0-9]{1,2})$", t)
+    if m:
+        pre = t[:m.start()]
+        # 前缀须含汉字或至少两个拉丁字母，规避 T34 之类型号名与纯数字标题
+        if re.search(r"[一-鿿]", pre) or len(re.findall(r"[a-z]", pre)) >= 2:
+            return int(m.group(1))
+    if re.search(r"[a-z]", raw):
+        m = re.search(r"\b(viii|vii|vi|iii|ix|iv|xi|ii|x|v)\b\s*$", raw)
+        if m and m.group(1) in _FB_ROMAN:
+            return _FB_ROMAN[m.group(1)]
+    return None
+
+
+def _fb_pick(arr, q: str, year: str, force_seq=None):
+    """从豆瓣 suggest 结果里挑最匹配的一条。片名相似度/年份之外再按续作序号强约束：
+    查询为续作（序号≥2）时只接受同序号候选，无序号首作与异序号候选强降权，杜绝串部。
+    force_seq 由上层按原始资源标题算好后贯穿所有降级查询：降级词（root/bare）可能已被
+    剥掉季/部字样、自身解析不出序号，此时仍强制按原组序号约束，避免降级回填回首作。"""
     qn = _fb_norm_title(q)
+    qseq = force_seq if force_seq is not None else _fb_seq(q)
     best, best_score = None, -1.0
     for it in arr:
         img = it.get("img") or ""
@@ -2657,8 +2744,26 @@ def _fb_pick(arr, q: str, year: str):
                     score += 1
             except ValueError:
                 pass
+        cseq = _fb_seq(it.get("title", ""))
+        if qseq is not None and qseq >= 2:
+            if cseq is not None:
+                score += 12 if cseq == qseq else -8
+            else:
+                # 续作查询遇到无序号首作：强降权，防止其靠片名包含关系反超
+                score -= 12
+        elif qseq == 1:
+            if cseq is not None and cseq >= 2:
+                score -= 8
+        else:
+            if cseq is not None and cseq >= 2:
+                score -= 12
         if score > best_score:
             best, best_score = it, score
+    if (best is not None and qseq is not None and qseq >= 2
+            and _fb_seq(best.get("title", "")) != qseq):
+        # 没有任何同序号有图候选：宁缺毋滥返回 None（上层按 miss 处理稍后重试），
+        # 不回退首作导致年份/评分/封面串到上一部。
+        return None
     return best
 
 
@@ -2676,7 +2781,8 @@ def _normalize_douban_cover_url(u: str) -> str:
     return u
 
 
-async def _douban_suggest_cover(q: str, client: httpx.AsyncClient, year: str = ""):
+async def _douban_suggest_cover(q: str, client: httpx.AsyncClient,
+                                year: str = "", force_seq=None):
     # movie.douban.com/j/subject_suggest 与热榜接口同域，已被边缘风控（HTTP 000）。
     # 改用移动端 rexxar 词条搜索 type=subject，取 subjects.items[].target 归一化后，
     # 仍交给原有 _fb_pick 做片名/年份相关性打分，缓存与软 miss 行为保持不变。
@@ -2717,10 +2823,17 @@ async def _douban_suggest_cover(q: str, client: httpx.AsyncClient, year: str = "
         })
     if not arr:
         return None
-    best = _fb_pick(arr, q, year)
+    best = _fb_pick(arr, q, year, force_seq=force_seq)
     if best is None:
-        # 相似度都很低时，只要第一条有图也可接受（rexxar 本身已按相关性排序）
-        best = next((x for x in arr if x.get("img")), None)
+        # 相似度都很低时，普通查询取第一条有图候选（rexxar 本身已按相关性排序）；
+        # 但续作查询的硬兜底也只接受同序号候选，避免在 _fb_pick 判空后又塞回首作。
+        pool = arr
+        qseq = force_seq if force_seq is not None else _fb_seq(q)
+        if qseq is not None and qseq >= 2:
+            same = [x for x in arr
+                    if x.get("img") and _fb_seq(x.get("title", "")) == qseq]
+            pool = same if same else []
+        best = next((x for x in pool if x.get("img")), None)
     if not best or not best.get("img"):
         return None
     # search 摘要在风控降级时可能只给封面/年份而缺评分：用条目 id 补一次 subject 详情，
@@ -2854,7 +2967,7 @@ async def poster_fallback(request: Request):
     http_used = 0          # 本次已发起的豆瓣 HTTP 请求数
     short_empty = 0        # 连续"干净短片名也空"的 root 数（疑似限流信号）
     async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=5.0)) as client:
-        async def ask(kw, yy):
+        async def ask(kw, yy, fseq=None):
             nonlocal http_used
             if http_used >= _FB_HTTP_BUDGET:
                 return None
@@ -2864,7 +2977,7 @@ async def poster_fallback(request: Request):
             else:
                 await asyncio.sleep(_FB_REQ_GAP)
             try:
-                info = await _douban_suggest_cover(kw, client, yy)
+                info = await _douban_suggest_cover(kw, client, yy, force_seq=fseq)
             except Exception:
                 info = None
             http_used += 1
@@ -2873,20 +2986,26 @@ async def poster_fallback(request: Request):
         for tkey in order:
             g = groups[tkey]
             root, q, year = g["root"], g["q"], g["year"]
+            # 组序号按信息最全的完整清洗词解析，回退 root；降级词会剥掉季/部字样，
+            # 必须把该序号显式贯穿 root/bare 查询，否则续作会在降级时回填首作 meta。
+            seq0 = _fb_seq(q)
+            if seq0 is None:
+                seq0 = _fb_seq(root)
             cached = _fb_cache_get(tkey)
             if cached is None:
                 info = None
                 # 1) 完整清洗词（含副标题，如"蜘蛛侠 纵横宇宙"），精准优先
                 if q.strip() != root.strip():
-                    info = await ask(q, year)
+                    info = await ask(q, year, seq0)
                 # 2) 完整词无果或本就等于 root → 查根片名（去掉演员名/类型噪声）
                 if not info:
-                    info = await ask(root, year)
-                # 3) rexxar 对带空格的中文季查询（如"庆余年 第二季"）会间歇 403：
-                #    去掉" 第X季"后缀用纯片名再查一次，由 _fb_pick 按年份选中正确季。
-                bare = re.sub(r"第[一二三四五六七八九十百\d]{1,3}季", "", root).strip()
+                    info = await ask(root, year, seq0)
+                # 3) rexxar 对带空格的中文季/部查询（如"庆余年 第二季"）会间歇 403：
+                #    去掉" 第X季/部"后缀用纯片名再查一次；force_seq 仍约束只选同序号，
+                #    纯片名下若只回首作则按 miss 处理，绝不把首作 meta 回填给续作。
+                bare = re.sub(r"第[一二三四五六七八九十百\d]{1,3}[季部]", "", root).strip()
                 if not info and bare and bare != root.strip():
-                    info = await ask(bare, year)
+                    info = await ask(bare, year, seq0)
                 if info:
                     _fb_cache_set(tkey, root, info)
                     short_empty = 0

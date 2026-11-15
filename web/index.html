@@ -232,7 +232,9 @@ button:focus-visible,a:focus-visible{outline:2px solid var(--gold);outline-offse
 .result-meta .count b{color:var(--gold);font-weight:600;font-family:var(--serif)}
 .result-meta .time{font-size:12.5px;color:var(--text-3)}
 .tabs{display:flex;gap:8px;overflow-x:auto;padding-bottom:14px;scrollbar-width:none;
-  border-bottom:1px solid var(--line);-webkit-overflow-scrolling:touch}
+  border-bottom:1px solid var(--line);-webkit-overflow-scrolling:touch;
+  -webkit-mask-image:linear-gradient(to right,#000 0,#000 calc(100% - 26px),transparent 100%);
+  mask-image:linear-gradient(to right,#000 0,#000 calc(100% - 26px),transparent 100%)}
 .tabs::-webkit-scrollbar{display:none}
 .tab{flex-shrink:0;padding:9px 17px;font-size:13.5px;color:var(--text-2);white-space:nowrap;
   border:1px solid var(--line);border-radius:20px;transition:.2s;position:relative;top:8px}
@@ -348,7 +350,7 @@ button:focus-visible,a:focus-visible{outline:2px solid var(--gold);outline-offse
 .modal-back{position:fixed;inset:0;z-index:50;background:rgba(8,7,5,.72);backdrop-filter:blur(8px);
   display:flex;align-items:center;justify-content:center;padding:24px;opacity:0;visibility:hidden;transition:.3s}
 .modal-back.show{opacity:1;visibility:visible}
-.modal{width:100%;max-width:780px;max-height:90vh;overflow-y:auto;background:linear-gradient(180deg,var(--surface-2),var(--bg-2));
+.modal{position:relative;width:100%;max-width:780px;max-height:90vh;overflow-y:auto;background:linear-gradient(180deg,var(--surface-2),var(--bg-2));
   border:1px solid var(--line-strong);border-radius:18px;transform:translateY(18px) scale(.98);transition:.35s cubic-bezier(.2,.8,.2,1);box-shadow:var(--shadow)}
 .modal-back.show .modal{transform:none}
 .modal-inner{display:flex;flex-direction:column}
@@ -509,7 +511,9 @@ button:focus-visible,a:focus-visible{outline:2px solid var(--gold);outline-offse
 .panel-head{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:18px 22px;
   border-bottom:1px solid var(--line);position:sticky;top:0;background:linear-gradient(180deg,var(--surface-2),rgba(32,29,22,.92));
   backdrop-filter:blur(10px);z-index:2}
-.panel-tabs{display:flex;gap:6px;overflow-x:auto;-webkit-overflow-scrolling:touch}
+.panel-tabs{display:flex;gap:6px;overflow-x:auto;-webkit-overflow-scrolling:touch;flex:1;min-width:0;
+  -webkit-mask-image:linear-gradient(to right,#000 0,#000 calc(100% - 24px),transparent 100%);
+  mask-image:linear-gradient(to right,#000 0,#000 calc(100% - 24px),transparent 100%)}
 .panel-tabs button{flex-shrink:0;padding:9px 16px;font-size:13.5px;color:var(--text-2);border-radius:9px;transition:.2s}
 .panel-tabs button:hover{color:var(--text)}
 .panel-tabs button.active{color:var(--gold);background:var(--gold-soft);font-weight:500}
@@ -531,9 +535,9 @@ button:focus-visible,a:focus-visible{outline:2px solid var(--gold);outline-offse
 .hrow .hmeta{font-size:12px;color:var(--text-3);margin-top:4px;display:flex;gap:10px;flex-wrap:wrap}
 .hrow .hmeta .cnt{color:var(--gold)}
 .hrow .hmeta .tot{color:var(--text-2)}
-.hrow .hgo{flex-shrink:0;color:var(--text-3);transition:.2s}
+.hrow .hgo{flex-shrink:0;width:40px;height:40px;display:flex;align-items:center;justify-content:center;color:var(--text-3);transition:.2s}
 .hrow .hmain:hover ~ .hgo,.hrow .hgo:hover{color:var(--gold)}
-.hrow .hdel{flex-shrink:0;width:30px;height:30px;border-radius:8px;display:flex;align-items:center;justify-content:center;color:var(--text-3);transition:.2s}
+.hrow .hdel{flex-shrink:0;width:40px;height:40px;border-radius:8px;display:flex;align-items:center;justify-content:center;color:var(--text-3);transition:.2s}
 .hrow .hdel svg{width:15px;height:15px}
 .hrow .hdel:hover{color:#c76b5c;background:rgba(255,255,255,.04)}
 
@@ -885,11 +889,13 @@ function safeUrl(u){
 /* 海报图多为 Telegram 图床(telesco.pe)，国内直连偶发超时：首次失败先露出首字占位，
    900ms 后带随机串重新请求一次；重试仍失败才永久隐藏，避免冷搜瞬间并发裂图。 */
 function retryImg(im){
-  if(im.dataset.rt){ im.style.display="none"; return; }
+  if(im.dataset.rt){ if(im.dataset.fb!=="1")im.style.display="none"; return; }
   im.dataset.rt="1";
   im.style.visibility="hidden";
   var src=im.getAttribute("src")||"";
   setTimeout(function(){
+    /* 等待重试期间豆瓣兜底已出图，则放弃源图重试，避免把已显示的封面再换回失败源 */
+    if(im.dataset.fb==="1")return;
     im.onload=function(){ this.style.visibility="visible"; };
     im.onerror=function(){ this.style.display="none"; fbFromImg(this); };
     im.src=src+(src.indexOf("?")>-1?"&":"?")+"rt="+(Date.now());
@@ -950,6 +956,8 @@ function fbApply(box,cover){
   var im=box.querySelector("img");
   if(im){
     if(im.dataset.fb==="1")return;
+    /* 源海报已成功加载并可见时保留源图，不用豆瓣封面顶替；仅在源图缺失/仍在加载或已失败时兜底 */
+    if(im.complete && im.naturalWidth>0 && im.style.display!=="none")return;
     im.dataset.fb="1";
     im.onerror=function(){this.style.display="none";};
     im.onload=function(){this.style.visibility="visible";this.style.display="";};
@@ -1021,14 +1029,15 @@ function fbFromImg(im){
   var box=(im&&im.closest)?im.closest(".poster,.lp,.mposter"):null;
   if(box&&box.dataset.note)fbEnqueue(box.dataset.note,box);
 }
-/* 给海报容器绑定片名：有图（即便失败）交给 onerror，无图直接入队 */
+/* 给海报容器绑定片名：无论有无源图都入队，让豆瓣兜底与源图并行竞速；fbApply 会在
+   源图已成功时保留源图，源图慢/失败则用豆瓣封面即时顶替（与详情弹窗出图时序一致）。 */
 var PH_FILM_SVG='<svg viewBox="0 0 24 24" width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 4v16M17 4v16M3 9h4M3 15h4M17 9h4M17 15h4"/></svg>';
 function phFilm(){return '<div class="ph">'+PH_FILM_SVG+'</div>';}
 function phLoading(){return '<div class="ph ph-loading"><span class="spin"></span>海报加载中</div>';}
 function fbBind(box,note,hasImg){
   if(!box)return;
   box.dataset.note=note||"";
-  if(!hasImg)fbEnqueue(note,box);
+  fbEnqueue(note,box);
 }
 
 /* ================= 年份 / 豆瓣评分（与海报补全同一次请求返回 meta） ================= */
@@ -1546,7 +1555,7 @@ function buildResultItem(it,view){
     c.innerHTML=
       '<div class="poster">'+
         '<div class="ph"><span class="ph-drive">'+esc(driveShort(it.drive))+'</span><span class="ph-char">'+esc(ch)+'</span><span class="ph-film"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 4v16M17 4v16M3 9h4M3 15h4M17 9h4M17 15h4"/></svg></span></div>'+
-        (img?'<img src="'+esc(img)+'" referrerpolicy="no-referrer" alt="" loading="lazy" onerror="retryImg(this)">':'')+
+        (img?'<img src="'+esc(img)+'" referrerpolicy="no-referrer" alt="" loading="eager" onerror="retryImg(this)">':'')+
         '<div class="veil"></div>'+
         (it.tags[0]?'<div class="qbadge">'+esc(it.tags[0])+'</div>':'')+
         favStarHtml(it)+
