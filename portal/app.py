@@ -47,7 +47,7 @@ logger = logging.getLogger("portal")
 UPSTREAM = os.environ.get("PANSOU_UPSTREAM", "http://pansou").rstrip("/")
 DB_PATH = os.environ.get("DB_PATH", "/app/data/portal.db")
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
-APP_VERSION = os.environ.get("APP_VERSION", "0.5.7")
+APP_VERSION = os.environ.get("APP_VERSION", "0.5.8")
 
 # SQLite 在线备份：启动一份 + 每日轮转，Connection.backup() 在 WAL 下也保证一致性
 BACKUP_ENABLED = bool(int(os.environ.get("BACKUP_ENABLED", "1")))
@@ -123,6 +123,9 @@ QUERY_VARIANT_MAX = int(os.environ.get("QUERY_VARIANT_MAX", "5"))
 QUERY_REWRITE_MIN_HITS = int(os.environ.get("QUERY_REWRITE_MIN_HITS", "8"))
 # 变体回源整体等待硬顶（秒），超时只收已完成的部分，绝不拖垮主响应
 QUERY_VARIANT_TIMEOUT = float(os.environ.get("QUERY_VARIANT_TIMEOUT", "8"))
+# 第十二批 B：真空结果负缓存 TTL（秒，分钟级短 TTL）。仅缓存"完整回源+变体+门控后
+# 确证 total==0"的结论，窗口内同词毫秒返空态；进程内态，重启/FTS 代际重建即清，不残留。
+NEG_EMPTY_TTL = float(os.environ.get("NEG_EMPTY_TTL", "120"))
 # 同义词召回（繁简体 + 作品别号/中英译名），纯规则词典、零外部依赖，可独立关闭
 SYNONYM_ENABLED = bool(int(os.environ.get("SYNONYM_ENABLED", "1")))
 # 每个裸片名最多取几个别号变体，防止大别名组爆量
@@ -597,6 +600,38 @@ def _ip_net_key(ip: str) -> str:
         return ip
 
 
+# ---------------- 第十二批 B：真空结果短 TTL 负缓存（进程内，绝不缺桶） ----------------
+# 定义须前置于模块加载期的 init_db()（代际重建分支会调用 _neg_empty_clear）。
+# 只缓存"已完整等过 PanSou 全部频道、变体召回跑完、净化/门控后确证为空"的结论，命中
+# 等价于一次确定性真空，不砍任何慢频道真结果。错误/熔断/超时/非 HTTP200 一律不写。
+# 进程内态，容器重启即空；FTS 代际重建时显式 clear，不跨代际残留。
+_NEG_EMPTY_CACHE: dict = {}
+
+
+def _neg_empty_key(keyword: str, src: str, clean_on: bool) -> str:
+    raw = "\x1f".join([(keyword or "").strip(), str(src or "all"),
+                       "1" if clean_on else "0"])
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def _neg_empty_get(tkey: str) -> bool:
+    exp = _NEG_EMPTY_CACHE.get(tkey)
+    if exp is None:
+        return False
+    if time.time() < exp:
+        return True
+    _NEG_EMPTY_CACHE.pop(tkey, None)
+    return False
+
+
+def _neg_empty_set(tkey: str) -> None:
+    _NEG_EMPTY_CACHE[tkey] = time.time() + NEG_EMPTY_TTL
+
+
+def _neg_empty_clear() -> None:
+    _NEG_EMPTY_CACHE.clear()
+
+
 # ---------------- 数据库 ----------------
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -758,6 +793,8 @@ def init_db():
             logger.info(
                 "fts cache gen %s->%s: dropped %s cached arts; "
                 "rebuild on next search", cur_gen, FTS_CACHE_GEN, dropped)
+            # 第十二批 B：缓存代际重建时同步作废真空负缓存，不跨代际残留
+            _neg_empty_clear()
         # 海报兜底匹配代际闸门：续作序号挑选升级后一次性作废旧 poster_fallback 持久缓存
         # （含误串到首作的 cover/year/rating，该表命中 TTL 长达 90 天），下次搜索按新规则
         # 重建；进程内 _FB_MEM 随重启自然清空。幂等，已处于当前代际则不再删除。
@@ -2273,6 +2310,25 @@ def _local_fallback_response(local_mbt, username, keyword, src, ip, reason,
                  "X-Source": "local-fallback"})
 
 
+# 负缓存的进程内态与 key/get/set/clear 已前置于 init_db 之前；此处仅保留命中后的标准
+# 空态响应构造（依赖 Response/check_abuse/metrics，仅请求期调用，无加载期前向引用问题）。
+def _negative_empty_response(keyword: str, src: str, ip: str, username: str):
+    """负缓存命中：毫秒返回与完整回源同构的标准空态（不写用户历史，events 仍记录）。"""
+    data = {"merged_by_type": {}, "total": 0,
+            "verified": {"checked": 0, "removed": 0, "deduped": 0,
+                         "source": "negative-cache", "clean_hidden": 0,
+                         "title_gated": 0}}
+    _record_event(ip, keyword, src, data)
+    check_abuse(ip, keyword, username)
+    metrics.search_total += 1
+    return Response(
+        content=json.dumps({"code": 0, "data": data},
+                           ensure_ascii=False).encode(),
+        status_code=200,
+        headers={"content-type": "application/json",
+                 "X-Source": "negative-cache"})
+
+
 async def _search_proxy(request: Request, username: str):
     qs = dict(request.query_params)
     keyword = qs.get("kw", "")
@@ -2281,6 +2337,7 @@ async def _search_proxy(request: Request, username: str):
     ip = client_ip(request)
     body = await request.body()
     target_url, body = _inject_clean_filter(request, body)
+    neg_tkey = _neg_empty_key(keyword, src, clean_on)
 
     # ===== 混合检索：先查本地 FTS5，命中足够则立即返回（SWR），后台异步保鲜 =====
     local_mbt: dict = {}
@@ -2339,6 +2396,11 @@ async def _search_proxy(request: Request, username: str):
                 status_code=200,
                 headers={"content-type": "application/json",
                          "X-Source": "local-cache"})
+
+    # 第十二批 B：真空负缓存命中，毫秒返标准空态，不再发起任何回源/磁力/变体请求。
+    # 仅 GET；写入点保证缓存的是完整回源后的确证空结论，故不缺桶（见函数尾 _neg_empty_set）。
+    if request.method == "GET" and keyword and _neg_empty_get(neg_tkey):
+        return _negative_empty_response(keyword, src, ip, username)
 
     # ===== 本地不足 / miss：回源 PanSou（原完整流程） =====
     # 方案A：海外磁力查询与核心回源并发（原为核心返回后串行 await）。
@@ -2453,6 +2515,10 @@ async def _search_proxy(request: Request, username: str):
                 data["merged_by_type"] = mbt
                 data["total"] = sum(
                     len(v) for v in data.get("merged_by_type", {}).values())
+                # 第十二批 B：至此已 HTTP200、code0、变体召回跑完、净化/门控结束，确证真空
+                # 才写短 TTL 负缓存。任何非 200/熔断/超时/异常都走不到这里，故不会误判缺桶。
+                if request.method == "GET" and data.get("total") == 0:
+                    _neg_empty_set(neg_tkey)
                 data["verified"] = {
                     "checked": len(check_urls), "removed": removed,
                     "deduped": deduped, "source": "upstream",
@@ -2698,6 +2764,13 @@ _FB_MAX_BATCH = 24           # 单次最多处理片名数
 _FB_REQ_GAP = 0.8            # 豆瓣请求间隔（suggest 限流敏感）
 _FB_BACKOFF_GAP = 2.2        # 一次调用内连续空结果（疑似限流）时的退避间隔
 _FB_HTTP_BUDGET = 14         # 单次调用最多发起的豆瓣 HTTP 请求数（按 root 分组后通常远低于此）
+# 第十二批 A：rexxar /search 出口风控熔断。N100 出口对 /search 持续 403 时，旧逻辑对每个
+# 待锚片名都先固定 sleep 再吃 403，冷启动分类计数因此空等 60-90s。熔断打开后 poster-fallback
+# 的远程补锚零 sleep、零 HTTP 直接短路（本地种子/orig/sqlite 锚定照常先跑，终态与风控时
+# 完全一致），冷却后半开仅放 1 个探测自愈，风控恢复即回到全功能。仅针对 /search，不碰 /subject。
+_REX_CB_FAIL_THRESHOLD = int(os.environ.get("REX_CB_FAIL_THRESHOLD", "3"))
+_REX_CB_COOL_SEC = float(os.environ.get("REX_CB_COOL_SEC", "60"))
+_REX_CB_PROBE_GAP = float(os.environ.get("REX_CB_PROBE_GAP", "0.1"))
 # 注：海报兜底代际常量 POSTER_FB_GEN 定义在顶部 FTS_CACHE_GEN 旁（须早于模块加载期 init_db）
 
 # 出现即截断的"技术参数"词（这些词之后基本是画质/集数/编码，不再是片名）
@@ -3030,19 +3103,97 @@ def _normalize_douban_cover_url(u: str) -> str:
     return u
 
 
+# ---- 第十二批 A：rexxar /search 风控熔断状态机（CLOSED → OPEN → HALF_OPEN 自愈） ----
+# 只统计 /search 的 HTTP 状态：明确非 200（403/429/边缘 000 等）计风控失败；HTTP 200 但
+# subjects 为空（真无片）由 _douban_suggest_cover 返 None、不在此计失败，避免误熔断。
+_REX_CB_STATE = {"fails": 0, "open_until": 0.0, "probing": False}
+_REX_CB_LOCK = asyncio.Lock()
+
+
+def _rex_cb_reset():
+    _REX_CB_STATE.update(fails=0, open_until=0.0, probing=False)
+
+
+def _rex_cb_force_open():
+    """启动探测已明确拿到风控非 200 时直接置 OPEN，令首个真实补锚请求即零空等。"""
+    _REX_CB_STATE.update(fails=_REX_CB_FAIL_THRESHOLD,
+                         open_until=time.time() + _REX_CB_COOL_SEC, probing=False)
+
+
+async def _rex_cb_begin() -> bool:
+    """True=本次允许发起一次 /search；False=熔断打开，调用方零 sleep、零 HTTP 直接短路。"""
+    now = time.time()
+    if _REX_CB_STATE["fails"] < _REX_CB_FAIL_THRESHOLD:
+        return True
+    if now < _REX_CB_STATE["open_until"]:
+        return False
+    # 冷却到期进入半开：全进程只放一个探测，其余继续短路，待探测结论再定状态
+    async with _REX_CB_LOCK:
+        now = time.time()
+        if now < _REX_CB_STATE["open_until"]:
+            return False
+        if _REX_CB_STATE["probing"]:
+            return False
+        _REX_CB_STATE["probing"] = True
+        return True
+
+
+def _rex_cb_record(http_ok: bool) -> None:
+    if http_ok:
+        _rex_cb_reset()
+        return
+    fails = _REX_CB_STATE["fails"] + 1
+    _REX_CB_STATE["fails"] = fails
+    _REX_CB_STATE["probing"] = False
+    if fails >= _REX_CB_FAIL_THRESHOLD:
+        _REX_CB_STATE["open_until"] = time.time() + _REX_CB_COOL_SEC
+
+
+async def _rex_startup_probe_safe() -> None:
+    """启动后台主动探一次 /search：持续 403 环境提前置 OPEN，冷启动首批 poster-fallback 即
+    短路；200 则保持 CLOSED 全功能。低速容错，异常静默不影响启动（半开探测仍会自愈）。"""
+    try:
+        await asyncio.sleep(2.0)
+        async with httpx.AsyncClient(
+                timeout=httpx.Timeout(8.0, connect=5.0)) as c:
+            try:
+                r = await c.get(
+                    REXXAR_BASE + "/search",
+                    params={"type": "subject", "q": "miying rex health probe",
+                            "count": 1},
+                    headers=REXXAR_HEADERS)
+                if r.status_code == 200:
+                    _rex_cb_reset()
+                else:
+                    _rex_cb_force_open()
+                    logger.info("rexxar /search startup probe blocked http=%s; "
+                                "breaker OPEN, local anchoring only", r.status_code)
+            except Exception as e:
+                _rex_cb_force_open()
+                logger.info("rexxar startup probe error %s; breaker OPEN", e)
+    except Exception:
+        pass
+
+
 async def _douban_suggest_cover(q: str, client: httpx.AsyncClient,
-                                year: str = "", force_seq=None):
+                                year: str = "", force_seq=None, _http=None):
     # movie.douban.com/j/subject_suggest 与热榜接口同域，已被边缘风控（HTTP 000）。
     # 改用移动端 rexxar 词条搜索 type=subject，取 subjects.items[].target 归一化后，
     # 仍交给原有 _fb_pick 做片名/年份相关性打分，缓存与软 miss 行为保持不变。
+    # 第十二批 A：_http 非空时回传首段 /search 的 HTTP 状态，熔断据此区分风控非200 与
+    # 200 真空（后者不记风控失败，不会误熔断）。
     try:
         r = await client.get(REXXAR_BASE + "/search",
                              params={"type": "subject", "q": q, "count": 10},
                              headers=REXXAR_HEADERS)
+        if _http is not None:
+            _http["search_status"] = r.status_code
         if r.status_code != 200:
             return None
         data = r.json()
     except Exception:
+        if _http is not None:
+            _http["search_status"] = 0
         return None
     cells = ((data.get("subjects") or {}).get("items")) or []
     arr = []
@@ -3449,16 +3600,28 @@ async def poster_fallback(request: Request):
             nonlocal http_used
             if http_used >= _FB_HTTP_BUDGET:
                 return None
-            # 连续多个短片名查空 → 已触发限流，退避后再发，避免继续被限流
-            if short_empty >= 2:
+            # 第十二批 A：熔断打开/半开未抢到探测时零 sleep、零 HTTP 短路，返回 None 后
+            # 走与持续 403 完全相同的 soft miss 终态（本地锚定此前已先跑过）。
+            if not await _rex_cb_begin():
+                return None
+            # 仅放行的真实请求才 sleep；已现风控失败时压到探测间隔，加速冷启动收敛。
+            if _REX_CB_STATE["fails"] > 0:
+                await asyncio.sleep(min(
+                    _FB_BACKOFF_GAP if short_empty >= 2 else _FB_REQ_GAP,
+                    _REX_CB_PROBE_GAP))
+            elif short_empty >= 2:
                 await asyncio.sleep(_FB_BACKOFF_GAP)
             else:
                 await asyncio.sleep(_FB_REQ_GAP)
+            http_meta = {}
             try:
-                info = await _douban_suggest_cover(kw, client, yy, force_seq=fseq)
+                info = await _douban_suggest_cover(
+                    kw, client, yy, force_seq=fseq, _http=http_meta)
             except Exception:
+                http_meta.setdefault("search_status", 0)
                 info = None
             http_used += 1
+            _rex_cb_record(http_meta.get("search_status") == 200)
             return info
 
         for tkey in order:
@@ -4910,3 +5073,5 @@ async def _start_watch():
         asyncio.create_task(fts_loop())
     # 第九批：四分类种子锚后台预热（只走稳定 /subject，低速容错、不阻塞启动）
     asyncio.create_task(_fb_seed_warmup_safe())
+    # 第十二批 A：启动主动探 /search 风控态，持续 403 环境提前置熔断，冷启动首批即零空等
+    asyncio.create_task(_rex_startup_probe_safe())
