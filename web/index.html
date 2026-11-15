@@ -1631,7 +1631,7 @@ function renderFilterBar(){
 }
 /* 单个结果卡片（grid）或行（list），供平铺与聚合视图复用 */
 function buildResultItem(it,view){
-  var img=it.images[0]||"";
+  var img=collectionCoverFor(it.note)||it.images[0]||"";
   if(view==="grid"){
     var c=document.createElement("div");c.className="card";
     c.setAttribute("tabindex","0");c.setAttribute("role","button");
@@ -1691,6 +1691,71 @@ function noteIsCollection(note){
   s=_normSeason(s);
   return _GRP_MULTI.test(s);
 }
+/* v0.5.10：合集卡海报优先取「合集主作品同名条目」的封面。修上游把捆内他作（合集捆了
+   双城之战剧集、自带封面抓到它）错挂到合集卡；与后端 app.py 的 _collection_ 系列与
+   _pick_collection_cover 镜像同款纯函数。主名需 >=2 纯汉字，只认非合集、同名（同系列前缀）
+   条目，选不到回退原逻辑。 */
+var _COLL_MARK=/合集|全系列|系列|全集|全季|两部|三部曲|打包|大全|\d+\s*部|\d+\s*季|全\s*\d+\s*季|两季|\d+\s*[-—~到]\s*\d+/;
+var _COLL_URL=/https?:\/\/\S+|[\w.-]+\.(?:com|cn|net|me|app|xyz|top|cc|io|org)\S*/gi;
+var _COLL_BRACKET=/[（(\[【][^）)\]】]*[）)\]】]/g;
+var _COLL_DROP=/美国|英国|韩国|日本|国产|中国|香港|台湾|法国|印度|泰国|德国|含\s*剧集|含\s*电视剧|附\s*电子书|电子书|剧集|电视剧|电影|动漫|动画|纪录片/g;
+function _collCompact(note){
+  var s=(note||"").toLowerCase().replace(_COLL_URL," ");
+  s=s.replace(_COLL_BRACKET," ").replace(/(?:19|20)\d{2}/g," ").replace(_COLL_DROP," ");
+  s=s.replace(/[^0-9a-z一-龥]+/g," ");
+  return s.replace(/\s+/g,"").trim();
+}
+/* 合集标题点名的主作品中文名（「沙丘2部合集 含剧集 (2024)」→「沙丘」）；非 >=2 纯汉字返回空 */
+function collectionMainName(note){
+  var s=(note||"").toLowerCase().replace(_COLL_URL," ");
+  var cut=s.length,mm=_COLL_MARK.exec(s);          /* 首个匹配即最早合集标志（可能裹括号内） */
+  if(mm)cut=mm.index;
+  var head=s.slice(0,cut).replace(_COLL_BRACKET," ").replace(/(?:19|20)\d{2}/g," ").replace(_COLL_DROP," ");
+  head=head.replace(/第[0-9一二两三四五六七八九十]+\s*[季部]/g," ").replace(/[sS]\d{1,2}/g," ");
+  head=head.replace(/[^0-9a-z一-龥]+/g," ");
+  var c=head.replace(/\s+/g,"").replace(/[0-9a-z]+$/,"");
+  var hm=/^[一-龥]+/.exec(c);
+  return (hm&&hm[0].length>=2&&hm[0]===c)?hm[0]:"";
+}
+/* 非合集候选条目的中文作品根（「沙丘2 Dune: Part Two」「沙丘2021」→「沙丘」） */
+function collectionCandidateRoot(note){
+  var c=_collCompact(note).replace(/第[0-9一二两三四五六七八九十]+\s*[季部]/g,"").replace(/[0-9a-z]+$/,"");
+  var hm=/^[一-龥]+/.exec(c);
+  return hm?hm[0]:"";
+}
+function _collEligible(note,main){
+  if(noteIsCollection(note))return false;            /* 跳过合集自身与其他合集，杜绝选回捆内他作封面 */
+  if(_GRP_ISOLATE.test(note))return false;           /* 小说/短剧/花絮/电子书等不参与 */
+  var r=collectionCandidateRoot(note);
+  return !!r&&(r===main||r.indexOf(main)===0);       /* 同名或同系列前缀，main>=2 汉字防单字乱配 */
+}
+/* 在跨网盘全池里给某合集挑主作品封面：作品锚封面（metaMap.cover）优先，其次同名条目自带图 */
+function collectionCoverOf(collNote,pool){
+  var main=collectionMainName(collNote);
+  if(!main)return "";
+  for(var i=0;i<pool.length;i++){var it=pool[i];
+    if(_collEligible(it.note,main)){var ac=metaMap[it.note]&&metaMap[it.note].cover;if(ac)return ac;}}
+  for(var j=0;j<pool.length;j++){var c2=pool[j];
+    if(_collEligible(c2.note,main)&&c2.images&&c2.images[0])return c2.images[0];}
+  return "";
+}
+/* 渲染期合集封面覆盖表 note->主作品封面；仅收录能选出的，选不到不入表、回退 it.images/兜底/占位 */
+var _collCoverMap={};
+function buildCollectionCoverMap(){
+  var map={},pool=[];
+  Object.keys(state.byType).forEach(function(t){
+    (state.byType[t]||[]).forEach(function(it){pool.push(it);});
+  });
+  for(var i=0;i<pool.length;i++){
+    var n=pool[i].note;
+    if(noteIsCollection(n)){
+      var cov=collectionCoverOf(n,pool);
+      if(cov)map[n]=cov;
+    }
+  }
+  return map;
+}
+function collectionCoverFor(note){return _collCoverMap[note]||"";}
 /* T1：组内代表卡优先选含中文、清洗后核心更短（噪声更少）的资源，组头展示更干净 */
 function pickRepNote(items){
   var rep=items[0],bestLen=Infinity,found=false;
@@ -1764,6 +1829,11 @@ function renderGrouped(container,rows){
 }
 
 /* ================= 渲染 ================= */
+/* v0.5.10：伪纪录片（Found Footage）是科幻/恐怖等虚构片手法，不是纪录片。
+   与后端 app.py _FAKE_DOC_RE/_is_fake_doc_text 同款，点号/空格/连写/大小写均认；
+   真幕后纪录片（含「纪录片」无「伪」前缀，如流浪地球2：再次冒险）不命中、保留。 */
+var _FAKE_DOC_RE=/伪纪录|found[\s.\-]*footage/i;
+function isFakeDocText(t){return _FAKE_DOC_RE.test(t||"");}
 /* T5：把类型入口搜索词映射到作品级 genre 规则；普通资源词返回 null（不启用过滤） */
 function genreRuleOf(kw){
   kw=(kw||"").toLowerCase();
@@ -1782,9 +1852,10 @@ function keepByGenre(it){
   var title=(it.note||"").toLowerCase();
   var hasG=!!(m&&(m.genres||m.kind));
   if(rule==="doc"){
-    if(hasG)return /纪录/.test(m.genres||"");
-    /* 回退同时识别「纪录片」与刮削文案「类型: 纪录」；混入剧集标注为「剧情」不会命中 */
-    return /纪录/.test(title);
+    /* v0.5.10：作品锚 genres 与标题回退两路都排伪纪录片/Found Footage，口径与后端同款；
+       回退仍识别「纪录片」与刮削文案「类型: 纪录」，但伪纪录片（虚构片手法）一律不放行 */
+    if(hasG)return /纪录/.test(m.genres||"")&&!isFakeDocText(m.genres||"");
+    return /纪录/.test(title)&&!isFakeDocText(title);
   }
   if(rule==="anime"){
     if(hasG)return /动画/.test(m.genres||"");
@@ -1815,6 +1886,8 @@ function filteredTotalAll(){
   return n;
 }
 function renderResults(){
+  /* v0.5.10：每次重渲用跨网盘全池重建合集封面覆盖表，接住异步到达的豆瓣作品锚；只改海报显示 */
+  _collCoverMap=buildCollectionCoverMap();
   var box=document.getElementById("results");
   var rawAll=state.byType[state.currentType]||[];
   var baseRows=genreRowsOf(rawAll);
@@ -1931,7 +2004,7 @@ function _trapModalTab(e){
 }
 function openModal(it){
   state.currentItem=it;
-  var img=it.images[0]||"";
+  var img=collectionCoverFor(it.note)||it.images[0]||"";
   var poster=document.getElementById("mPoster");
   /* 有源海报直接给图；无图先显加载态（而非静态占位字），补全到达即替换 */
   poster.innerHTML=(img?phFilm():'')+(img?'<img src="'+esc(img)+'" referrerpolicy="no-referrer" onerror="retryImg(this)">':phLoading());

@@ -47,7 +47,7 @@ logger = logging.getLogger("portal")
 UPSTREAM = os.environ.get("PANSOU_UPSTREAM", "http://pansou").rstrip("/")
 DB_PATH = os.environ.get("DB_PATH", "/app/data/portal.db")
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
-APP_VERSION = os.environ.get("APP_VERSION", "0.5.9")
+APP_VERSION = os.environ.get("APP_VERSION", "0.5.10")
 
 # SQLite 在线备份：启动一份 + 每日轮转，Connection.backup() 在 WAL 下也保证一致性
 BACKUP_ENABLED = bool(int(os.environ.get("BACKUP_ENABLED", "1")))
@@ -2100,6 +2100,26 @@ def _is_genre_entry(keyword: str) -> bool:
     return bool(_GENRE_ENTRY_RE.search((keyword or "").lower()))
 
 
+# ===== 第十四批：伪纪录片（Found Footage）剔除出纪录片分类 =====
+# 「伪纪录/伪纪录片/Found Footage」是科幻/恐怖等虚构片的拍摄手法，不是纪录片；
+# 真幕后纪录片（含「纪录片」但无「伪」前缀，如《流浪地球2：再次冒险》）保留。
+# 与前端 web/index.html keepByGenre 的 doc 判定保持同款，纯函数由 python 单测锁定，
+# 前端计数与列表同增同减，两处正则改动必须同步。
+_FAKE_DOC_RE = re.compile(r"伪纪录|found[\s.\-]*footage", re.IGNORECASE)
+
+
+def _is_fake_doc_text(text: str) -> bool:
+    """标题或作品类型文本是否带伪纪录片/Found Footage 标记（点号/空格/连写/大小写均认）。"""
+    return bool(_FAKE_DOC_RE.search((text or "").lower()))
+
+
+def _doc_text_keep(text: str) -> bool:
+    """纪录片分类无作品锚时的文本回退口径：含「纪录」且不是伪纪录片才保留。
+    对齐前端 keepByGenre 的 doc 回退（在原 /纪录/ 命中基础上加同款伪纪录排除）。"""
+    t = text or ""
+    return ("纪录" in t) and (not _is_fake_doc_text(t))
+
+
 def _title_gate_roots(keyword: str):
     """普通片名搜索可接受的标题根集合（小写）。先剥画质/规格词得作品名，再取其
     等价根（原根/繁体/别号），并零 HTTP 并入库内已锚作品的规范名与 orig 拉丁名，
@@ -2126,6 +2146,106 @@ def _title_gate_roots(keyword: str):
 _GATE_SUBSEQ_FALLBACK_MAX = int(os.environ.get("GATE_SUBSEQ_FALLBACK_MAX", "4"))
 _GATE_BUNDLE_RE = re.compile(r"合集|全系列|系列|全集|全季|两部|三部曲|打包|大全")
 _GATE_YEAR_FULL_RE = re.compile(r"(?:19|20)\d{2}")
+
+# ===== 第十四批：合集/打包卡海报优先取合集主作品同名条目的封面 =====
+# 合集资源（如「沙丘2部合集 含剧集」）上游自带 cover 可能是捆内他作（双城之战）封面。
+# 通用规则：先从合集标题提取点名的主作品名（沙丘），只在同池「非合集、同名（同系列前缀）」
+# 条目里取封面——豆瓣作品锚封面优先，其次条目自带图；选不到返回空串，由调用方回退原有
+# 自带封面/兜底/占位逻辑，绝不跨作品硬配图。与前端 index.html collectionMainName/
+# collectionCoverOf 镜像同款，python 单测为规则锚点，两处改动必须同步。
+_COLLECTION_MARK_RE = re.compile(
+    r"合集|全系列|系列|全集|全季|两部|三部曲|打包|大全|"
+    r"\d+\s*部|\d+\s*季|全\s*\d+\s*季|两季|\d+\s*[-—~到]\s*\d+")
+_COLLECTION_ISOLATE_RE = re.compile(
+    r"小说|电子书|txt|全文|全本|漫画|有声|解说|短剧|番外|花絮|预告|剪辑|素材|pdf|epub|mobi",
+    re.IGNORECASE)
+_COLLECTION_URL_RE = re.compile(
+    r"https?://\S+|[\w.-]+\.(?:com|cn|net|me|app|xyz|top|cc|io|org)\S*", re.IGNORECASE)
+# 国家/地区与「含剧集/附电子书」等合集附带语，提取主名时丢弃，避免污染作品根
+_COLLECTION_DROP_RE = re.compile(
+    r"美国|英国|韩国|日本|国产|中国|香港|台湾|法国|印度|泰国|德国|"
+    r"含\s*剧集|含\s*电视剧|附\s*电子书|电子书|剧集|电视剧|电影|动漫|动画|纪录片")
+_COLLECTION_HAN_HEAD_RE = re.compile(r"[一-鿿]+")
+_COLLECTION_BRACKET_RE = re.compile(r"[（(\[【][^）)\]】]*[）)\]】]")
+
+
+def _collection_compact(note: str) -> str:
+    """候选条目作品根用的紧凑清洗：去 URL/括号块/四位年份/国家附带语，非中英数字转空格后
+    压成无空白连续串（与前端 groupKeyOf 白名单归一思路一致，独立实现以便纯函数单测）。"""
+    s = (note or "").lower()
+    s = _COLLECTION_URL_RE.sub(" ", s)
+    s = _COLLECTION_BRACKET_RE.sub(" ", s)
+    s = _GATE_YEAR_FULL_RE.sub(" ", s)
+    s = _COLLECTION_DROP_RE.sub(" ", s)
+    s = re.sub(r"[^0-9a-z一-鿿]+", " ", s)
+    return re.sub(r"\s+", "", s).strip()
+
+
+def _collection_main_name(note: str) -> str:
+    """从合集标题提取点名的主作品中文名（「沙丘2部合集 含剧集 (2024)」→「沙丘」）。
+    在最早出现的合集标志处截断，去尾部序号/季部装饰；仅当结果为 >=2 个纯汉字时返回，
+    拉丁混杂或过短一律返回空串（保守不启用，避免单字/英文乱配）。"""
+    s = (note or "").lower()
+    s = _COLLECTION_URL_RE.sub(" ", s)
+    # 先在原始串上定位最早合集标志（标志可能裹在括号里，如「（1-2全系列）」），再清洗截断前段
+    cut = len(s)
+    for m in _COLLECTION_MARK_RE.finditer(s):
+        if m.start() < cut:
+            cut = m.start()
+    head = s[:cut]
+    head = _COLLECTION_BRACKET_RE.sub(" ", head)
+    head = _GATE_YEAR_FULL_RE.sub(" ", head)
+    head = _COLLECTION_DROP_RE.sub(" ", head)
+    head = re.sub(r"第[0-9一二两三四五六七八九十]+\s*[季部]", " ", head)
+    head = re.sub(r"[sS]\d{1,2}", " ", head)
+    head = re.sub(r"[^0-9a-z一-鿿]+", " ", head)
+    compact = re.sub(r"\s+", "", head)
+    compact = re.sub(r"[0-9a-z]+$", "", compact)  # 去尾部「2」「s02」「4k」等残留
+    m = _COLLECTION_HAN_HEAD_RE.match(compact)
+    if m and len(m.group(0)) >= 2 and m.group(0) == compact:
+        return m.group(0)
+    return ""
+
+
+def _collection_candidate_root(note: str) -> str:
+    """非合集候选条目的中文作品根：紧凑清洗后取开头连续汉字（「沙丘2 Dune: Part Two」
+    「沙丘2021」均归到「沙丘」）；无汉字头（纯拉丁标题）返回空串，不参与中文主名匹配。"""
+    compact = _collection_compact(note)
+    compact = re.sub(r"第[0-9一二两三四五六七八九十]+\s*[季部]", "", compact)
+    compact = re.sub(r"[0-9a-z]+$", "", compact)
+    m = _COLLECTION_HAN_HEAD_RE.match(compact)
+    return m.group(0) if m else ""
+
+
+def _pick_collection_cover(coll_note: str, candidates, anchor_covers=None) -> str:
+    """合集卡封面选取纯函数。candidates=同池条目 list[dict(note, cover)]，anchor_covers=
+    {note: 豆瓣作品锚封面}（作品级权威、优先）。只认与合集主作品同名（根相等或主名为其
+    同系列前缀）的非合集、非隔离条目：第一轮取作品锚封面，第二轮取条目自带图；都没有返回
+    空串，调用方回退原有逻辑。合集自身/其他合集一律不合格，杜绝选回捆内他作封面。"""
+    main = _collection_main_name(coll_note)
+    if not main:
+        return ""
+    anchor_covers = anchor_covers or {}
+
+    def eligible(n: str) -> bool:
+        n = n or ""
+        if _COLLECTION_MARK_RE.search(n.lower()):
+            return False
+        if _COLLECTION_ISOLATE_RE.search(n):
+            return False
+        root = _collection_candidate_root(n)
+        return bool(root) and (root == main or root.startswith(main))
+
+    pool = list(candidates or [])
+    for c in pool:  # 第一轮：豆瓣作品锚封面
+        n = c.get("note") or ""
+        if eligible(n) and anchor_covers.get(n):
+            return anchor_covers[n]
+    for c in pool:  # 第二轮：主作品同名条目自带封面
+        n = c.get("note") or ""
+        if eligible(n) and c.get("cover"):
+            return c["cover"]
+    return ""
 
 
 def _gate_title_seq(note: str):
