@@ -47,7 +47,7 @@ logger = logging.getLogger("portal")
 UPSTREAM = os.environ.get("PANSOU_UPSTREAM", "http://pansou").rstrip("/")
 DB_PATH = os.environ.get("DB_PATH", "/app/data/portal.db")
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
-APP_VERSION = os.environ.get("APP_VERSION", "0.5.6")
+APP_VERSION = os.environ.get("APP_VERSION", "0.5.7")
 
 # SQLite 在线备份：启动一份 + 每日轮转，Connection.backup() 在 WAL 下也保证一致性
 BACKUP_ENABLED = bool(int(os.environ.get("BACKUP_ENABLED", "1")))
@@ -2050,6 +2050,129 @@ def _variant_relevant(orig_kw: str, item: dict) -> bool:
     return True
 
 
+# ===== 第十一批：普通片名搜索标题相关性门控 =====
+# 上游 FTS 按帖子正文匹配，常用词组（如成语「突如其来」）会被他片剧情简介误命中，
+# 站内无真资源却塞满无关热门片。此处只认标题相关性，正文提及不计命中。
+# 与前端 genreRuleOf 的分类触发词严格对齐：分类入口结果池本就依赖正文命中，整池豁免。
+_GENRE_ENTRY_RE = re.compile(
+    r"纪录片|动漫|动画|卡通|电视剧|剧集|美剧|韩剧|日剧|港剧|台剧|国剧|电影")
+
+
+def _is_genre_entry(keyword: str) -> bool:
+    """首页分类入口（genreFilter 非空）在后端只表现为类型词 kw，识别即豁免门控。"""
+    return bool(_GENRE_ENTRY_RE.search((keyword or "").lower()))
+
+
+def _title_gate_roots(keyword: str):
+    """普通片名搜索可接受的标题根集合（小写）。先剥画质/规格词得作品名，再取其
+    等价根（原根/繁体/别号），并零 HTTP 并入库内已锚作品的规范名与 orig 拉丁名，
+    保住 Dune Part Two/Oppenheimer 这类靠作品锚收敛的译名。返回 (base, roots)。"""
+    base, _ = _split_quality_query(keyword)
+    roots = set(_equivalent_roots(base))
+    try:
+        anchor = _fb_orig_match(base, _fb_root(base))  # 纯本地只读反查，零 HTTP
+    except Exception:
+        anchor = None
+    if anchor:
+        for name in (anchor.get("title", ""), anchor.get("orig", "")):
+            ct = clean_title(name)[0]
+            if ct:
+                roots.add(ct.lower())
+            r = _root_core(ct).lower()
+            if r:
+                roots.add(r)
+    return base, roots
+
+
+_GATE_BUNDLE_RE = re.compile(r"合集|全系列|系列|全集|全季|两部|三部曲|打包|大全")
+_GATE_YEAR_FULL_RE = re.compile(r"(?:19|20)\d{2}")
+
+
+def _gate_title_seq(note: str):
+    """门控专用续作序号：先抹掉四位年份再复用 _fb_seq，避免『沙丘2 2024』被
+    _fb_seq 把年份尾巴 24 误判成序号 24 而误杀；第N部/Part 等不受年份抹除影响。"""
+    return _fb_seq(_GATE_YEAR_FULL_RE.sub(" ", note or ""))
+
+
+def _title_seq_hit(root: str, note: str) -> bool:
+    """续作序号宽松命中（仅在普通子串未命中时兜底）：root 带续作序号（如『沙丘2』）
+    而标题把序号写作『沙丘 第二部』『沙丘 2 国语』等被空格/第X部隔断的形式时，
+    要求片名主体一致且序号相同；合集/系列打包含该主体即放行。首作（4 位年份、无序号）
+    与同名异作不命中，沿用第九批防串首作口径。无序号 root（庆余年/成语）直接 False。"""
+    qseq = _fb_seq(root)
+    if not qseq or qseq < 2:
+        return False
+    name = re.sub(r"[0-9]{1,2}$", "", _fb_name_norm(root))
+    if not name:
+        return False
+    ct = clean_title(note)[0]
+    tbase = re.sub(r"[0-9]{1,2}$", "", _fb_name_norm(ct))
+    bundle = bool(_GATE_BUNDLE_RE.search(ct))
+    contains = name in tbase
+    # 严格主体边界：主体后紧跟别的汉字视为同名异作（『沙丘魔堡2』）；合集打包另行放宽
+    strict_ok = (tbase == name or (tbase.startswith(name)
+                                   and not re.match(r"[一-鿿]", tbase[len(name):])))
+    tseq = _gate_title_seq(note)
+    if tseq is not None:
+        # 标题带明确序号（第N部/季、Part、罗马、结尾裸数字）时以它为准，强一致才同源
+        return strict_ok and tseq == qseq
+    if not (strict_ok or (bundle and contains)):
+        return False
+    if re.search(re.escape(name) + r"[\s·:：\-_/]*"
+                 + r"(?<![0-9])" + str(qseq) + r"(?![0-9])", ct.lower()):
+        return True                               # 裸序号不在结尾（如『沙丘 2 国语』）
+    if bundle:                                   # 合集/全系列打包，含该主体即涵盖续作
+        return True
+    return False
+
+
+def _main_title_relevant(base: str, roots: set, item: dict) -> bool:
+    """主词结果标题相关性：作品名根须在条目标题（clean_title 清洗后，原始标题兜底）
+    中形成一次干净命中；明确异季/年代明显不同则剔除。根长 <2 的极短查询不门控，
+    保守保留以免误伤。副标题、年份、季号、合集字样不影响根的子串命中。"""
+    if len(_root_core(base)) < 2:
+        return True
+    note = item.get("note") or ""
+    ct = clean_title(note)[0].lower()
+    low = note.lower()
+    if not any(_root_hits(r, ct) or _root_hits(r, low)
+               or _title_seq_hit(r, note) for r in roots):
+        return False
+    # 续作序号强一致：查询明确是第 N 部（沙丘2）而标题显式标注异序号（第三部）时否决，
+    # 优先级高于子串命中；标题无明确序号（裸 2021/合集/无序号）不在此拦，交给其余规则。
+    qseq = _fb_eff_seq(base, _fb_root(base))
+    if qseq is not None and qseq >= 2:
+        tseq = _gate_title_seq(note)
+        if tseq is not None and tseq != qseq:
+            return False
+    _, season = _parse_season(base)
+    ts = _title_season(note)
+    if season is not None and ts is not None and ts != season:
+        return False
+    qy = [int(y) for y in _YEAR_RE.findall(base)]
+    ty = [int(y) for y in _YEAR_RE.findall(note)]
+    if qy and ty and all(abs(y - b) > 2 for y in ty for b in qy):
+        return False
+    return True
+
+
+def _apply_title_gate(mbt: dict, keyword: str):
+    """普通片名搜索标题门控：分类入口整池豁免；其余只保留标题相关条目并丢弃清空的
+    网盘桶，返回 (新mbt, 门控剔除数)。纯响应层过滤，不改 FTS 入库与分网盘保底配额。"""
+    if _is_genre_entry(keyword):
+        return mbt, 0
+    base, roots = _title_gate_roots(keyword)
+    if len(_root_core(base)) < 2:
+        return mbt, 0
+    out, gated = {}, 0
+    for drive, items in (mbt or {}).items():
+        kept = [it for it in items if _main_title_relevant(base, roots, it)]
+        gated += len(items) - len(kept)
+        if kept:
+            out[drive] = kept
+    return out, gated
+
+
 def _mbt_url_count(mbt: dict) -> int:
     urls = set()
     for items in (mbt or {}).values():
@@ -2125,13 +2248,16 @@ def _local_fallback_response(local_mbt, username, keyword, src, ip, reason,
     clean_hidden = 0
     if clean_on:
         mbt, clean_hidden = _apply_clean_filter(mbt, keyword)
+    # 第十一批：普通片名搜索标题门控（分类入口在函数内整池豁免），与 clean 正片过滤正交
+    mbt, title_gated = _apply_title_gate(mbt, keyword)
     total = sum(len(v) for v in mbt.values())
     if not total:
         return None
     data = {"merged_by_type": mbt, "total": total,
             "verified": {"checked": 0, "removed": dead_hidden,
                          "deduped": deduped, "source": "local-fallback",
-                         "clean_hidden": clean_hidden, "degraded": reason}}
+                         "clean_hidden": clean_hidden,
+                         "title_gated": title_gated, "degraded": reason}}
     _record_history(username, keyword, src, data)
     _record_event(ip, keyword, src, data)
     check_abuse(ip, keyword, username)
@@ -2185,6 +2311,8 @@ async def _search_proxy(request: Request, username: str):
             if clean_on:
                 local_mbt, local_clean_hidden = _apply_clean_filter(
                     local_mbt, keyword)
+            # 第十一批：标题相关性门控，缓存读取层过滤，不影响 FTS 入库与保底配额
+            local_mbt, local_title_gated = _apply_title_gate(local_mbt, keyword)
             local_total = sum(len(v) for v in local_mbt.values())
             # 后台刷新（TTL 过期回源 + 验证剔除失效），本次响应不等待
             bg = asyncio.create_task(_fts_bg_refresh(keyword))
@@ -2197,6 +2325,7 @@ async def _search_proxy(request: Request, username: str):
                     "verified": {"checked": 0, "removed": local_dead_hidden,
                                  "deduped": local_deduped,
                                  "clean_hidden": local_clean_hidden,
+                                 "title_gated": local_title_gated,
                                  "source": "local"}}
             if local_total:
                 _record_history(username, keyword, src, data)
@@ -2319,6 +2448,8 @@ async def _search_proxy(request: Request, username: str):
                 clean_hidden = 0
                 if clean_on:
                     mbt, clean_hidden = _apply_clean_filter(mbt, keyword)
+                # 第十一批：普通片名搜索标题门控，回源实时结果同样只留标题相关条目
+                mbt, title_gated = _apply_title_gate(mbt, keyword)
                 data["merged_by_type"] = mbt
                 data["total"] = sum(
                     len(v) for v in data.get("merged_by_type", {}).values())
@@ -2326,6 +2457,7 @@ async def _search_proxy(request: Request, username: str):
                     "checked": len(check_urls), "removed": removed,
                     "deduped": deduped, "source": "upstream",
                     "clean_hidden": clean_hidden,
+                    "title_gated": title_gated,
                     "variants": v_count, "recalled": v_added}
                 metrics.search_total += 1
                 metrics.search_upstream += 1
@@ -4500,6 +4632,8 @@ async def _mcp_handle(payload):
                     meta = {}
             # 与网页端同源：先剔除已确认死链，再按网盘/画质收敛
             mbt, _ = _filter_dead_mbt(mbt)
+            # 第十一批：MCP 直搜同样套标题相关性门控（base 已剥画质词，分类词在函数内豁免）
+            mbt, _ = _apply_title_gate(mbt, base)
             if drive:
                 mbt = {drive: mbt[drive]} if mbt.get(drive) else {}
             mbt = _mcp_filter_by_quality(mbt, qtokens)
