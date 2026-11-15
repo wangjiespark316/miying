@@ -1019,7 +1019,14 @@ function fbFlush(){
         if(!gk)return;
         if(covers[t])gCover[gk]=covers[t];
         var m0=metas[t];
-        if(m0&&(m0.rating||m0.year))gMeta[gk]=m0;
+        /* 同组共享 meta 时按完整度（评分权重高于年份）择优，避免先到的年份-only 占位、
+           后到带评分的 meta 无法覆盖，导致组内复用方丢评分（第十批 T2）。 */
+        if(m0&&(m0.rating||m0.year)){
+          var prev=gMeta[gk];
+          var rankPrev=prev?((prev.rating?2:0)+(prev.year?1:0)):0;
+          var rankNow=(m0.rating?2:0)+(m0.year?1:0);
+          if(rankNow>rankPrev)gMeta[gk]=m0;
+        }
       });
       batch.forEach(function(t){
         var gk=groupKeyOf(t);
@@ -1695,6 +1702,19 @@ function pickRepNote(items){
   }
   return rep;
 }
+/* 第十批 T2：组头年份评分取组内「最完整」的一条 meta，避免代表卡 meta 只到年份、
+   组内其它成员已有评分时组卡丢评分（同 sid 数据一致，跨成员取最全不引入串作风险）。
+   评分权重高于年份；任一成员都无 meta 时回退 null，由调用方沿用代表 note。 */
+function bestMetaNote(notes){
+  var best=null,bestRank=0;
+  for(var i=0;i<notes.length;i++){
+    var m=metaMap[notes[i]];
+    if(!m)continue;
+    var rank=(m.rating?2:0)+(m.year?1:0);
+    if(rank>bestRank){bestRank=rank;best=notes[i];}
+  }
+  return best;
+}
 function renderGrouped(container,rows){
   var map={},order=[];
   rows.forEach(function(it){
@@ -1720,11 +1740,10 @@ function renderGrouped(container,rows){
     var repNote=rep.note||"";
     /* 组头标题：有作品锚用豆瓣规范中文名，否则用代表卡原标题；版本列表内逐条仍显示各自原 note */
     var headTitle=(g.anchor&&g.anchor.title)?g.anchor.title:(repNote||"未命名");
-    /* 年份评分行绑定到组内任一 metaMap 已就绪的 note（同 sid 数据一致）；合集不套单作 meta */
-    var metaNote=repNote;
-    if(!metaMap[metaNote]){
-      for(var i=0;i<g.items.length;i++){if(metaMap[g.items[i].note]){metaNote=g.items[i].note;break;}}
-    }
+    /* 年份评分行：在组内所有成员里挑 meta 最完整（优先带豆瓣评分）的 note，
+       同 sid 数据一致；代表卡 meta 残缺年份-only 时不再拖丢整组评分。合集不套单作 meta */
+    var grpNotes=g.items.map(function(it){return it.note;});
+    var metaNote=bestMetaNote(grpNotes)||repNote;
     var grp=document.createElement("div");grp.className="grp";
     var head=document.createElement("button");head.className="grp-head";
     head.innerHTML='<svg class="grp-caret" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg>'+
@@ -1786,6 +1805,15 @@ function genreRowsOf(rows){
   if(!state.genreFilter)return rows;
   return (rows||[]).filter(keepByGenre);
 }
+/* 第十批 T1：分类页标题主计数的唯一口径——当前 genre+画质筛选下，全来源所有网盘桶
+   逐条过滤后的条目总和。只依赖筛选条件，不依赖 currentType，故切换任一来源标签数字恒定。 */
+function filteredTotalAll(){
+  var n=0;
+  availableTypes().forEach(function(t){
+    n+=applyQuality(genreRowsOf(state.byType[t]||[])).length;
+  });
+  return n;
+}
 function renderResults(){
   var box=document.getElementById("results");
   var rawAll=state.byType[state.currentType]||[];
@@ -1796,9 +1824,16 @@ function renderResults(){
   /* 分类页计数依赖异步作品锚：锚定在途时冻结为「…锚定中」，drain 后由 fbSettleSchedule 定格，
      普通词（无 genreFilter）条数不依赖锚，始终显示实时值，不受冻结影响。 */
   var busy=!!state.genreFilter&&anchorWorking();
-  var filtered=state.quality!=="all"||baseRows.length<rawAll.length;
-  if(rtEl)rtEl.textContent=busy?"…":(filtered?rows.length:baseRows.length);
-  if(tailEl)tailEl.textContent=busy?" 锚定中，计数稍后定格":(filtered?" 条（共 "+rawAll.length+" 条）":" 条资源");
+  if(state.genreFilter){
+    /* 分类页：定格后总数取全来源 genre+画质过滤总和，与 currentType 无关，切来源标签恒定；
+       锚定在途（含切源瞬间）一律冻结「…锚定中」，不先冒临时数。 */
+    if(rtEl)rtEl.textContent=busy?"…":filteredTotalAll();
+    if(tailEl)tailEl.textContent=busy?" 锚定中，计数稍后定格":" 条资源";
+  }else{
+    var filtered=state.quality!=="all"||baseRows.length<rawAll.length;
+    if(rtEl)rtEl.textContent=busy?"…":(filtered?rows.length:baseRows.length);
+    if(tailEl)tailEl.textContent=busy?" 锚定中，计数稍后定格":(filtered?" 条（共 "+rawAll.length+" 条）":" 条资源");
+  }
   box.innerHTML="";
   if(!rows.length){
     var empty=document.createElement("div");
@@ -1807,8 +1842,10 @@ function renderResults(){
     if(busy){
       emptyMsg='<h4>正在匹配作品类型…</h4><p>作品锚分批到达中，计数稳定后自动定格</p>';
     }else if(rawAll.length===0){
-      /* 当前网盘来源本就 0 条：指引切上方真实存在的「来源标签」，不再误指画质「全部」 */
-      emptyMsg='<h4>这个网盘来源下暂无资源</h4><p>切到上方其它网盘来源标签看看，全部来源共 '+state.total+' 条</p>';
+      /* 当前网盘来源本就 0 条：指引切上方真实存在的「来源标签」，不再误指画质「全部」。
+         分类页数字与标题主计数同口径（全来源 genre+画质过滤后），普通词用未过滤全量。 */
+      var allN=state.genreFilter?filteredTotalAll():state.total;
+      emptyMsg='<h4>这个网盘来源下暂无资源</h4><p>切到上方其它网盘来源标签看看，全部来源共 '+allN+' 条</p>';
     }else{
       /* 来源有数据、是画质/类型筛空：「全部」确为画质筛选按钮，此指引才成立 */
       emptyMsg='<h4>该筛选下暂无资源</h4><p>换一个画质或类型筛选，或把画质切到「全部」查看这 '+rawAll.length+' 条</p>';

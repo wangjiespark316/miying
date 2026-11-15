@@ -47,7 +47,7 @@ logger = logging.getLogger("portal")
 UPSTREAM = os.environ.get("PANSOU_UPSTREAM", "http://pansou").rstrip("/")
 DB_PATH = os.environ.get("DB_PATH", "/app/data/portal.db")
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
-APP_VERSION = os.environ.get("APP_VERSION", "0.5.5")
+APP_VERSION = os.environ.get("APP_VERSION", "0.5.6")
 
 # SQLite 在线备份：启动一份 + 每日轮转，Connection.backup() 在 WAL 下也保证一致性
 BACKUP_ENABLED = bool(int(os.environ.get("BACKUP_ENABLED", "1")))
@@ -2601,6 +2601,10 @@ _FB_SEED_ANCHORS = [
     # —— 剧集 tv ——
     {"sid": "25853071", "name": "庆余年 第一季",
      "aka": ["庆余年", "庆余年第一季"]},
+    # 第十批：续作补锚。/search 被风控时第二季原本无任何锚（年份靠前端标题解析、评分恒空），
+    # 改由稳定 /subject 预热落锚；无序号「庆余年」查询仍按种子顺序先命中上一条第一季。
+    {"sid": "34937650", "name": "庆余年 第二季",
+     "aka": ["庆余年第二季", "庆余年2"]},
     {"sid": "35465232", "name": "狂飙", "aka": []},
     {"sid": "4922787", "name": "后宫·甄嬛传",
      "aka": ["甄嬛传", "Empresses in the Palace"]},
