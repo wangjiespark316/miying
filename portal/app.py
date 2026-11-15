@@ -47,7 +47,7 @@ logger = logging.getLogger("portal")
 UPSTREAM = os.environ.get("PANSOU_UPSTREAM", "http://pansou").rstrip("/")
 DB_PATH = os.environ.get("DB_PATH", "/app/data/portal.db")
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
-APP_VERSION = os.environ.get("APP_VERSION", "0.5.8")
+APP_VERSION = os.environ.get("APP_VERSION", "0.5.9")
 
 # SQLite 在线备份：启动一份 + 每日轮转，Connection.backup() 在 WAL 下也保证一致性
 BACKUP_ENABLED = bool(int(os.environ.get("BACKUP_ENABLED", "1")))
@@ -2121,6 +2121,9 @@ def _title_gate_roots(keyword: str):
     return base, roots
 
 
+# 第十三批：精确管线（FTS+回源+门控后）结果总数 <= 该阈值才启用子序列兜底；
+# 精确充足的查询完全不进第二遍，行为与 v0.5.8 逐字一致。可用环境变量覆盖。
+_GATE_SUBSEQ_FALLBACK_MAX = int(os.environ.get("GATE_SUBSEQ_FALLBACK_MAX", "4"))
 _GATE_BUNDLE_RE = re.compile(r"合集|全系列|系列|全集|全季|两部|三部曲|打包|大全")
 _GATE_YEAR_FULL_RE = re.compile(r"(?:19|20)\d{2}")
 
@@ -2175,38 +2178,125 @@ def _main_title_relevant(base: str, roots: set, item: dict) -> bool:
     if not any(_root_hits(r, ct) or _root_hits(r, low)
                or _title_seq_hit(r, note) for r in roots):
         return False
-    # 续作序号强一致：查询明确是第 N 部（沙丘2）而标题显式标注异序号（第三部）时否决，
-    # 优先级高于子串命中；标题无明确序号（裸 2021/合集/无序号）不在此拦，交给其余规则。
+    # 续作序号/季/年份硬约束抽为 _gate_hard_conflict：精确路与第十三批子序列兜底共用
+    # 同一套强一致口径；标题缺显式序号/季/年份时不判冲突（保守不误杀）。
+    return not _gate_hard_conflict(base, note)
+
+
+def _gate_hard_conflict(base: str, note: str) -> bool:
+    """门控共享硬约束，命中任一冲突返回 True（应剔除）：
+    1) 查询明确是第 N 部（沙丘2）而标题显式标注异序号（第三部）——标题无明确序号
+       （裸 2021/合集/无序号）不判，交给其余规则；2) 显式季号不一致；3) 查询带年份且
+       与标题年份全部相差 >2 年。纯函数，精确门控与子序列兜底都必须经过这里，杜绝串部。"""
     qseq = _fb_eff_seq(base, _fb_root(base))
     if qseq is not None and qseq >= 2:
         tseq = _gate_title_seq(note)
         if tseq is not None and tseq != qseq:
-            return False
+            return True
     _, season = _parse_season(base)
     ts = _title_season(note)
     if season is not None and ts is not None and ts != season:
-        return False
+        return True
     qy = [int(y) for y in _YEAR_RE.findall(base)]
     ty = [int(y) for y in _YEAR_RE.findall(note)]
     if qy and ty and all(abs(y - b) > 2 for y in ty for b in qy):
+        return True
+    return False
+
+
+# ===== 第十三批：保守子序列兜底（只救跳字简称，绝不放宽相关性底线）=====
+# 仅作用于 clean_title 剥离括号/画质/年份/季饰后的标题核心，永不作用正文 note；
+# 查询纯片名需 >=3 个汉字且不含拉丁（拉丁维持 orig 锚匹配），精确管线总数低于阈值才启用。
+_GATE_SUBSEQ_PART_TAIL_RE = re.compile(
+    r"part(?:[0-9]+|one|two|three|four|five|six|seven|eight|nine|ten|"
+    r"viii|vii|vi|iii|ix|iv|xi|ii|x|v)$")
+_GATE_SUBSEQ_HAN_RE = re.compile(r"[一-鿿]+")
+
+
+def _subseq_query_core(base: str):
+    """子序列兜底专用的查询纯片名核心（紧凑、仅汉字）。base 已在 _title_gate_roots 前
+    经 _split_quality_query 剥画质；这里再去第X季/部尾、Part/罗马与结尾裸序号，只留纯汉字
+    片名。>=3 个汉字且不含拉丁/数字才返回，否则 None：两字短词必乱配、拉丁查询走 orig。"""
+    name = _fb_name_norm(_fb_root(base))
+    name = _GATE_SUBSEQ_PART_TAIL_RE.sub("", name)
+    name = re.sub(r"[0-9]+$", "", name)
+    if len(name) >= 3 and _GATE_SUBSEQ_HAN_RE.fullmatch(name):
+        return name
+    return None
+
+
+def _subseq_core_hit(qname: str, tname: str):
+    """qname 全部字符按原序构成 tname 的子序列（可跳字、不允许缺字/乱序），并加跨度约束
+    防长标题乱凑：双指针贪心取每个查询字符在标题中的最早命中，首末命中跨度 span 内允许
+    插入的字数 gap=span-qlen 不得超过 G=max(3, qlen-1)（纽约扒手 qlen4、纽约最后的扒手
+    span7、gap3 贴边通过；再多插一字即拒）。返回 (是否命中, 实际跨度或 None)。"""
+    j, i0, i1 = 0, -1, -1
+    for i, ch in enumerate(tname):
+        if j < len(qname) and ch == qname[j]:
+            if i0 < 0:
+                i0 = i
+            i1 = i
+            j += 1
+    if j != len(qname) or i0 < 0:
+        return False, None
+    span = i1 - i0 + 1
+    gap_budget = max(3, len(qname) - 1)
+    return (span - len(qname) <= gap_budget), span
+
+
+def _subseq_fallback_hit(base: str, qname: str, item: dict) -> bool:
+    """逐条保守兜底：只在标题核心（clean_title 清洗后再紧凑化的片名，绝不取正文原文）上
+    做受控子序列匹配；通过后强制再跑 _gate_hard_conflict 的序号/季/年份硬约束，确保
+    沙丘2 不混首部、庆余年2 不入首季、查询年份不符不放行。"""
+    note = item.get("note") or ""
+    tname = _fb_name_norm(clean_title(note)[0])
+    if not tname:
         return False
-    return True
+    ok, _ = _subseq_core_hit(qname, tname)
+    if not ok:
+        return False
+    return not _gate_hard_conflict(base, note)
 
 
 def _apply_title_gate(mbt: dict, keyword: str):
     """普通片名搜索标题门控：分类入口整池豁免；其余只保留标题相关条目并丢弃清空的
-    网盘桶，返回 (新mbt, 门控剔除数)。纯响应层过滤，不改 FTS 入库与分网盘保底配额。"""
+    网盘桶，返回 (新mbt, 门控剔除数)。纯响应层过滤，不改 FTS 入库与分网盘保底配额。
+
+    第十三批改为两遍：第一遍沿用 _main_title_relevant 精确过滤并统计精确总数；仅当精确
+    总数 <= _GATE_SUBSEQ_FALLBACK_MAX 且查询满足子序列启用条件（>=3 汉字、非拉丁）时，
+    第二遍对被剔除条目跑保守子序列兜底，命中项追加到同桶精确项之后（故天然排精确之后、
+    计数口径不变）。精确充足则不进第二遍，与 v0.5.8 逐字一致。网页与 MCP 共用本函数，
+    且负缓存空判定在本函数之后——兜底命中使 total>0，故不会误写空负缓存。"""
     if _is_genre_entry(keyword):
         return mbt, 0
     base, roots = _title_gate_roots(keyword)
     if len(_root_core(base)) < 2:
         return mbt, 0
-    out, gated = {}, 0
+    qname = _subseq_query_core(base)
+    out, gated, exact_total, rejected = {}, 0, 0, []
     for drive, items in (mbt or {}).items():
-        kept = [it for it in items if _main_title_relevant(base, roots, it)]
-        gated += len(items) - len(kept)
+        kept, rej = [], []
+        for it in items:
+            (kept if _main_title_relevant(base, roots, it) else rej).append(it)
+        exact_total += len(kept)
+        gated += len(rej)
+        rejected.extend((drive, it) for it in rej)
         if kept:
             out[drive] = kept
+    if qname and exact_total <= _GATE_SUBSEQ_FALLBACK_MAX:
+        # 精确不足：保守子序列兜底，捞回的条目排在同桶精确项之后；捞回一条剔除数减一。
+        for drive, it in rejected:
+            if _subseq_fallback_hit(base, qname, it):
+                out.setdefault(drive, []).append(it)
+                gated -= 1
+        # 上游按整词匹配，跳字简称（如「纽约扒手」对「纽约最后的扒手」）可能整词零召回，
+        # 本次 mbt 无候选可捞；改从本地 FTS 库已沉淀条目按标题子序列补召回。补召回条目
+        # 本不在本次输入内，故不计入 gated；仅认标题、过同一硬冲突、排死链与重复 URL。
+        have_urls = {(it.get("url") or "").strip()
+                     for items in (mbt or {}).values() for it in items}
+        for drive, its in _fts_subseq_recall(base, qname, have_urls).items():
+            if its:
+                out.setdefault(drive, []).extend(its)
     return out, gated
 
 
@@ -4281,6 +4371,39 @@ def _fts_local_search(kw: str):
                 mbt.setdefault(drive, []).append(item)
     # 读路径统一做域名复核，覆盖历史索引中插件自报类型错误的存量数据
     return _rebucket_by_domain(mbt)
+
+
+def _fts_subseq_recall(base: str, qname: str, have_urls: set):
+    """第十三批子序列补召回：精确管线不足且上游对跳字简称整词零召回时，从本地 FTS 库
+    已沉淀条目里捞回同作品资源。红线：只匹配 idx_arts.note 标题（不查正文/kws），与门控
+    兜底同一判定 _subseq_fallback_hit（标题核心子序列+跨度+续作/季/年硬冲突）；排除已确认
+    死链与本次已在桶 URL。首字 LIKE 粗筛（子序列首字必在标题中）后 Python 精算，低频触发、
+    限量 FTS_QUERY_LIMIT，返回按 drive 分组、按库内画质分排序的 mbt。"""
+    if not FTS_ENABLED or not qname:
+        return {}
+    head = qname[0].replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    pat = "%" + head + "%"
+    try:
+        with db() as conn:
+            rows = conn.execute(
+                "SELECT url,drive,raw FROM idx_arts WHERE note LIKE ? ESCAPE '\\' "
+                "ORDER BY score DESC, last_seen DESC LIMIT ?",
+                (pat, FTS_QUERY_LIMIT)).fetchall()
+    except Exception as e:
+        logger.warning("fts subseq recall error: %s", e)
+        return {}
+    out: dict = {}
+    for r in rows:
+        url = (r["url"] or "").strip()
+        if not url or url in have_urls or url in _dead_urls:
+            continue
+        try:
+            item = json.loads(r["raw"])
+        except Exception:
+            continue
+        if _subseq_fallback_hit(base, qname, item):
+            out.setdefault(r["drive"], []).append(item)
+    return out
 
 
 def _fts_purge_stale():
