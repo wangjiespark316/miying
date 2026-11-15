@@ -1459,7 +1459,7 @@ function processData(merged){
   availableTypes().forEach(function(t){
     (state.byType[t]||[]).forEach(function(it){allNotes.push(it.note);});
   });
-  fbPrefetch(allNotes);
+  fbPrefetch(allNotes.map(function(n){return collectionFbName(n);}));
   if(state.total===0){
     document.getElementById("resultSection").classList.add("hidden");
     document.getElementById("emptyState").classList.remove("hidden");
@@ -1651,7 +1651,7 @@ function buildResultItem(it,view){
       '<div class="s">'+(it.pwd?'提取码 <span class="pwd">'+esc(it.pwd)+'</span>':prettySource(it.source))+'</div></div>';
     c.addEventListener("click",function(){openModal(it);});
     c.addEventListener("keydown",function(e){if(e.key==="Enter"||e.key===" "){e.preventDefault();openModal(it);}});
-    fbBind(c.querySelector(".poster"),it.note,!!img);
+    fbBind(c.querySelector(".poster"),collectionFbName(it.note),!!img);
     fillMetaLine(c.querySelector(".meta-line"),it.note);
     var fb=c.querySelector(".fav");
     if(fb)fb.addEventListener("click",function(e){e.stopPropagation();toggleFav(it,fb);});
@@ -1670,7 +1670,7 @@ function buildResultItem(it,view){
     '<span class="go"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg></span>';
   row.addEventListener("click",function(){openModal(it);});
   row.addEventListener("keydown",function(e){if(e.key==="Enter"||e.key===" "){e.preventDefault();openModal(it);}});
-  fbBind(row.querySelector(".lp"),it.note,!!img);
+  fbBind(row.querySelector(".lp"),collectionFbName(it.note),!!img);
   fillMetaLine(row.querySelector(".meta-line"),it.note);
   var lf=row.querySelector(".lfav");
   if(lf){lf.classList.toggle("on",!!favMap[it.url]);lf.addEventListener("click",function(e){e.stopPropagation();toggleFav(it,lf);});}
@@ -1716,6 +1716,29 @@ function collectionMainName(note){
   var c=head.replace(/\s+/g,"").replace(/[0-9a-z]+$/,"");
   var hm=/^[一-龥]+/.exec(c);
   return (hm&&hm[0].length>=2&&hm[0]===c)?hm[0]:"";
+}
+/* v0.5.11：合集卡海报补全（poster-fallback）专用查询名。冷态下合集整串 note
+  （如「沙丘2部合集 含剧集 (2024)…附电子书」）经后端 clean_title/_fb_root 得到的根片名
+  （「沙丘2部合集」）不等于任何作品锚规范名，种子桥接失败、rexxar 熔断期零 HTTP 必返空，
+  合集卡便永久停在单字占位。这里把合集 note 归一成其点名的主作品干净片名（复用
+  collectionMainName），并在主名紧后识别「N部/N季」系列序号（「沙丘2部合集」→「沙丘2」），
+  使合集卡与同名主作品单片卡共享同一 fbMap 键，冷态首个 poster-fallback 即被本地作品锚
+  零 HTTP 确定性命中，不再依赖熔断冷却或会话预热。非合集、或主名提取不出（拉丁/单字）一律
+  原样返回 note，单片卡与聚合组卡行为零变化。 */
+function collectionFbName(note){
+  note=note||"";
+  if(!noteIsCollection(note))return note;
+  var main=collectionMainName(note);
+  if(!main)return note;
+  var at=note.indexOf(main);
+  if(at>=0){
+    var sm=/^\s*([0-9]+)\s*[部季]/.exec(note.slice(at+main.length));
+    if(sm){
+      var seq=parseInt(sm[1],10);
+      if(seq>=2)return main+String(seq);
+    }
+  }
+  return main;
 }
 /* 非合集候选条目的中文作品根（「沙丘2 Dune: Part Two」「沙丘2021」→「沙丘」） */
 function collectionCandidateRoot(note){
@@ -1919,9 +1942,15 @@ function renderResults(){
          分类页数字与标题主计数同口径（全来源 genre+画质过滤后），普通词用未过滤全量。 */
       var allN=state.genreFilter?filteredTotalAll():state.total;
       emptyMsg='<h4>这个网盘来源下暂无资源</h4><p>切到上方其它网盘来源标签看看，全部来源共 '+allN+' 条</p>';
+    }else if(baseRows.length===0){
+      /* v0.5.11：来源桶 rawAll 有条、但全部不符合当前作品类型（genre 过滤后 baseRows 为 0）。
+         画质本就是「全部」也救不回，旧文案误指画质按钮且报过滤前 rawAll 条数（如 PikPak
+         「查看这 1 条」却实际 0 条）。改为指引切换作品类型/来源标签，不出现矛盾数字。 */
+      emptyMsg='<h4>这个来源下没有符合当前类型的资源</h4><p>换一个作品类型，或切到上方其它网盘来源标签看看</p>';
     }else{
-      /* 来源有数据、是画质/类型筛空：「全部」确为画质筛选按钮，此指引才成立 */
-      emptyMsg='<h4>该筛选下暂无资源</h4><p>换一个画质或类型筛选，或把画质切到「全部」查看这 '+rawAll.length+' 条</p>';
+      /* v0.5.11：类型过滤后 baseRows 仍有条、仅被画质筛空。数字改用 baseRows.length——
+         把画质切回「全部」后真正可见的条数；旧用 rawAll.length 含被类型滤掉的条目，会偏大。 */
+      emptyMsg='<h4>该画质筛选下暂无资源</h4><p>换一个画质筛选，或把画质切到「全部」查看这 '+baseRows.length+' 条</p>';
     }
     empty.innerHTML=emptyMsg;
     box.appendChild(empty);renderFilterBar();return;
@@ -1932,12 +1961,12 @@ function renderResults(){
     renderGrouped(container,rows);
     box.appendChild(container);
     /* 与非聚合一致地预热豆瓣封面（含源海报可能失败、磁力按片名匹配的情形） */
-    fbPrefetch(rows.map(function(r){return r.note;}));
+    fbPrefetch(rows.map(function(r){return collectionFbName(r.note);}));
     revealBatch(box.querySelectorAll(".grp, .card, .lrow"),{dur:420,step:20,max:14});
   }else{
     rows.forEach(function(it){container.appendChild(buildResultItem(it,state.view));});
     box.appendChild(container);
-    fbPrefetch(rows.map(function(r){return r.note;}));
+    fbPrefetch(rows.map(function(r){return collectionFbName(r.note);}));
     revealBatch(container.children,{dur:state.view==="grid"?520:420,step:state.view==="grid"?28:22,max:14});
   }
   renderFilterBar();
@@ -2008,7 +2037,7 @@ function openModal(it){
   var poster=document.getElementById("mPoster");
   /* 有源海报直接给图；无图先显加载态（而非静态占位字），补全到达即替换 */
   poster.innerHTML=(img?phFilm():'')+(img?'<img src="'+esc(img)+'" referrerpolicy="no-referrer" onerror="retryImg(this)">':phLoading());
-  fbBind(poster,it.note,!!img);
+  fbBind(poster,collectionFbName(it.note),!!img);
   document.getElementById("mDrive").textContent=driveLabel(it.drive);
   document.getElementById("mTitle").textContent=it.note||"未命名资源";
   var mMeta=document.getElementById("mMeta");

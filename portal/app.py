@@ -47,7 +47,7 @@ logger = logging.getLogger("portal")
 UPSTREAM = os.environ.get("PANSOU_UPSTREAM", "http://pansou").rstrip("/")
 DB_PATH = os.environ.get("DB_PATH", "/app/data/portal.db")
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
-APP_VERSION = os.environ.get("APP_VERSION", "0.5.10")
+APP_VERSION = os.environ.get("APP_VERSION", "0.5.11")
 
 # SQLite 在线备份：启动一份 + 每日轮转，Connection.backup() 在 WAL 下也保证一致性
 BACKUP_ENABLED = bool(int(os.environ.get("BACKUP_ENABLED", "1")))
@@ -2246,6 +2246,35 @@ def _pick_collection_cover(coll_note: str, candidates, anchor_covers=None) -> st
         if eligible(n) and c.get("cover"):
             return c["cover"]
     return ""
+
+
+# 与前端 noteIsCollection 的 _GRP_MULTI 同款（刻意窄于封面选取的 _COLLECTION_MARK_RE：
+# 不含裸「N部/两部/三部曲/打包/大全」）。裸《沙丘 2部 4K HDR》这类单片资源不被认成合集，
+# 海报补全名必须原样返回、保留原封面，不得归并到「沙丘2」。
+_COLLECTION_FB_GROUP_RE = re.compile(
+    r"两季|全\s*\d+\s*季|\d+\s*季|\d+\s*[-—~到]\s*\d+|合集|全系列|系列")
+
+
+def _collection_fb_name(note: str) -> str:
+    """合集卡海报补全（poster-fallback）专用查询名，与前端 index.html collectionFbName
+    镜像同款、python 单测为规则锚点（两处改动必须同步）。非合集（无合集/系列/季组标志）
+    原样返回；合集则归一点名的主作品中文名，主名紧后带「N部/N季」且 N>=2 时附加系列序号
+    （『沙丘2部合集 含剧集 (2024)…』→『沙丘2』，『XX全系列』→『XX』）；主名提取不出
+    （拉丁/单字）回退原 note。干净主名让 poster-fallback 冷态即可零 HTTP 桥接本地作品锚，
+    避免合集整串标题根名不等于任何种子规范名、rexxar 熔断期返空导致永久占位。"""
+    note = note or ""
+    low = note.lower()
+    if not _COLLECTION_FB_GROUP_RE.search(low):
+        return note
+    main = _collection_main_name(note)
+    if not main:
+        return note
+    idx = low.find(main)
+    if idx >= 0:
+        m = re.match(r"^\s*([0-9]+)\s*[部季]", low[idx + len(main):])
+        if m and int(m.group(1)) >= 2:
+            return main + m.group(1)
+    return main
 
 
 def _gate_title_seq(note: str):
