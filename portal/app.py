@@ -47,7 +47,7 @@ logger = logging.getLogger("portal")
 UPSTREAM = os.environ.get("PANSOU_UPSTREAM", "http://pansou").rstrip("/")
 DB_PATH = os.environ.get("DB_PATH", "/app/data/portal.db")
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
-APP_VERSION = os.environ.get("APP_VERSION", "0.5.3")
+APP_VERSION = os.environ.get("APP_VERSION", "0.5.4")
 
 # SQLite 在线备份：启动一份 + 每日轮转，Connection.backup() 在 WAL 下也保证一致性
 BACKUP_ENABLED = bool(int(os.environ.get("BACKUP_ENABLED", "1")))
@@ -207,7 +207,9 @@ FTS_CACHE_GEN = 2
 # 海报兜底匹配规则代际：续作序号（沙丘2/第N部/Part N）挑选逻辑升级后 +1，启动即一次性
 # 作废 poster_fallback 持久缓存（命中 TTL 90 天），令误串首作的封面/year/rating 下次重建。
 # gen2：修复降级查询（root/bare 剥掉季/部后）序号约束丢失导致的汉字季/部续作串首作。
-POSTER_FB_GEN = 2
+# gen3：poster_fallback 增作品锚字段（sid/genres/kind/orig），支撑中英原名同作品确定性
+#       聚合与分类入口 genre 真过滤；旧行无这些字段，一次性清表按新契约重建。
+POSTER_FB_GEN = 3
 # 热搜/热榜覆盖不到的固定常用词（热门 / 经典画质标杆，与 warm-cache 对齐）
 FTS_STATIC_WORDS = ["沙丘2", "阿凡达", "让子弹飞", "奥本海默", "流浪地球2",
                     "满江红", "封神第一部", "年会不能停", "热辣滚烫",
@@ -672,6 +674,10 @@ def init_db():
             title TEXT DEFAULT '',
             year TEXT DEFAULT '',
             rating TEXT DEFAULT '',
+            sid TEXT DEFAULT '',
+            genres TEXT DEFAULT '',
+            kind TEXT DEFAULT '',
+            orig TEXT DEFAULT '',
             miss INTEGER DEFAULT 0,
             ts REAL NOT NULL)""")
         # 老库补 rating 列（第六批前缓存表不存评分，导致 meta 行评分恒空）
@@ -680,6 +686,15 @@ def init_db():
             db.execute("ALTER TABLE poster_fallback ADD COLUMN rating TEXT DEFAULT ''")
             # 旧命中缓存缺评分：置过期，下次请求重拉并回写评分（封面可重建）
             db.execute("UPDATE poster_fallback SET ts=0 WHERE cover IS NOT NULL AND cover<>''")
+        # gen3 作品锚列：豆瓣条目 id（中英聚合的确定性锚）、类型、影视种类、原名。
+        # 均可空，ALTER 仅补列；旧行缺字段由 POSTER_FB_GEN 清表重建统一回收，幂等不破坏库。
+        for _fc, _ddl in (
+                ("sid", "ALTER TABLE poster_fallback ADD COLUMN sid TEXT DEFAULT ''"),
+                ("genres", "ALTER TABLE poster_fallback ADD COLUMN genres TEXT DEFAULT ''"),
+                ("kind", "ALTER TABLE poster_fallback ADD COLUMN kind TEXT DEFAULT ''"),
+                ("orig", "ALTER TABLE poster_fallback ADD COLUMN orig TEXT DEFAULT ''")):
+            if fb_cols and _fc not in fb_cols:
+                db.execute(_ddl)
         # ---- 混合 FTS5 预索引 ----
         # 资源条目主表：存原始 item JSON（raw），返回时直接还原，保证前端渲染一致
         db.execute("""CREATE TABLE IF NOT EXISTS idx_arts(
@@ -2593,10 +2608,19 @@ def clean_title(note: str):
         r"(?:com|cn|net|org|me|app|xyz|top|cc|io|tv|info|club|site|live|pro|vip)"
         r"(?:/[A-Za-z0-9._~:/?#\[\]@!$&()*+,;=%-]*)?",
         " ", s, flags=re.IGNORECASE)
-    s = re.sub(r"^\s*(资源名称|文件名称|文件名|名称|资源名)\s*[:：]\s*", "", s)
-    # 去掉开头的【】/[] 标签（可能多个）
+    s = re.sub(r"^\s*(资源名称|文件名称|文件名|名称|资源名|标题|分享文件|短剧名称)\s*[:：]\s*",
+               "", s)
+    # 循环剥离开头噪声：方角/圆括号标签块、emoji/符号前导、榜单序号（042. / Top8. / No.008）。
+    # 不剥《》（常裹片名）；序号分隔符后不得紧跟数字，护住"8.5分"与四位年份。
     for _ in range(4):
-        s = re.sub(r"^\s*[【\[][^】\]]*[】\]]\s*", "", s)
+        prev = s
+        s = re.sub(r"^\s*[【\[（(〔][^】\]）)〕]*[】\]）)〕]\s*", "", s)
+        s = re.sub(r"^[^\u4e00-\u9fffA-Za-z0-9]+", "", s)
+        s = re.sub(r"^\s*(?:top|no)\.?\s*0*\d{1,3}(?:\s*[.、_：:](?!\d))?\s*",
+                   "", s, flags=re.IGNORECASE)
+        s = re.sub(r"^\s*0*\d{1,3}\s*[.、_](?!\d)\s*", "", s)
+        if s == prev:
+            break
     # 去掉开头的分类前缀："短剧：""国剧 "等
     s = re.sub(r"^\s*(短剧|电影|电视剧|国剧|美剧|韩剧|日剧|港剧|台剧|动漫|综艺)\s*[:：.\-\s]+",
                "", s)
@@ -2836,16 +2860,22 @@ async def _douban_suggest_cover(q: str, client: httpx.AsyncClient,
         best = next((x for x in pool if x.get("img")), None)
     if not best or not best.get("img"):
         return None
-    # search 摘要在风控降级时可能只给封面/年份而缺评分：用条目 id 补一次 subject 详情，
-    # 详情接口稳定返回 rating/year（失败则静默保留摘要结果，不影响封面）。
+    # 用条目 id 拉一次 subject 详情（该端点比 /search 稳定，200 可持续取到）：
+    # 1) search 摘要风控降级时可能缺评分/年份，详情补齐；
+    # 2) 取作品锚 original_title/type/genres，供前端中英原名确定性聚合与 genre 真过滤。
+    # 详情失败静默保留摘要结果（仍含 cover 与 search 给出的 id），不影响封面兜底。
     sid = (best.get("id") or "").strip()
-    if sid and not best.get("rating"):
+    best["sid"] = sid
+    best["genres"] = ""
+    best["kind"] = ""
+    best["orig"] = ""
+    if sid:
         try:
             dr = await client.get(REXXAR_BASE + "/subject/" + sid, headers=REXXAR_HEADERS)
             if dr.status_code == 200:
                 det = dr.json()
                 drv = det.get("rating")
-                if isinstance(drv, dict) and drv.get("value"):
+                if isinstance(drv, dict) and drv.get("value") and not best.get("rating"):
                     best["rating"] = ("%g" % drv["value"]) if isinstance(
                         drv["value"], (int, float)) else str(drv["value"])
                 if not best.get("year") and det.get("year"):
@@ -2853,12 +2883,27 @@ async def _douban_suggest_cover(q: str, client: httpx.AsyncClient,
                 dcover = det.get("cover_url") or ""
                 if dcover and not best.get("img"):
                     best["img"] = _normalize_douban_cover_url(dcover)
+                ot = (det.get("original_title") or "").strip()
+                if ot and ot != best.get("title", ""):
+                    best["orig"] = ot
+                kd = (det.get("type") or "").strip().lower()
+                if kd in ("movie", "tv"):
+                    best["kind"] = kd
+                elif det.get("is_tv"):
+                    best["kind"] = "tv"
+                gl = det.get("genres")
+                if isinstance(gl, list) and gl:
+                    best["genres"] = ",".join(str(x).strip() for x in gl if str(x).strip())
         except Exception:
             pass
     return {"cover": best.get("img", ""),
             "title": best.get("title", ""),
             "year": best.get("year", ""),
-            "rating": best.get("rating", "")}
+            "rating": best.get("rating", ""),
+            "sid": best.get("sid", ""),
+            "genres": best.get("genres", ""),
+            "kind": best.get("kind", ""),
+            "orig": best.get("orig", "")}
 
 
 def _fb_key(q: str):
@@ -2881,11 +2926,14 @@ def _fb_cache_get(tkey: str):
         return e if now - e["ts"] < _fb_ttl_of(e) else None
     with db() as conn:
         r = conn.execute(
-            "SELECT cover,title,year,rating,miss,ts FROM poster_fallback WHERE tkey=?",
+            "SELECT cover,title,year,rating,sid,genres,kind,orig,miss,ts "
+            "FROM poster_fallback WHERE tkey=?",
             (tkey,)).fetchone()
     if r:
         e = {"cover": r["cover"], "title": r["title"], "year": r["year"],
              "rating": r["rating"] or "",
+             "sid": r["sid"] or "", "genres": r["genres"] or "",
+             "kind": r["kind"] or "", "orig": r["orig"] or "",
              "miss": r["miss"], "ts": r["ts"], "soft": 0}
         if now - r["ts"] < _fb_ttl_of(e):
             _FB_MEM[tkey] = e
@@ -2900,6 +2948,10 @@ def _fb_cache_set(tkey: str, q: str, info, soft=False):
          "title": (info or {}).get("title", ""),
          "year": (info or {}).get("year", ""),
          "rating": (info or {}).get("rating", ""),
+         "sid": (info or {}).get("sid", ""),
+         "genres": (info or {}).get("genres", ""),
+         "kind": (info or {}).get("kind", ""),
+         "orig": (info or {}).get("orig", ""),
          "miss": 0 if info and info.get("cover") else 1,
          "soft": 1 if (soft and not (info and info.get("cover"))) else 0,
          "ts": now}
@@ -2909,13 +2961,15 @@ def _fb_cache_set(tkey: str, q: str, info, soft=False):
     try:
         with db() as conn:
             conn.execute(
-                """INSERT INTO poster_fallback(tkey,qtitle,cover,title,year,rating,miss,ts)
-                   VALUES(?,?,?,?,?,?,?,?)
+                """INSERT INTO poster_fallback(tkey,qtitle,cover,title,year,rating,
+                     sid,genres,kind,orig,miss,ts)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(tkey) DO UPDATE SET qtitle=excluded.qtitle,
                      cover=excluded.cover,title=excluded.title,year=excluded.year,
-                     rating=excluded.rating,miss=excluded.miss,ts=excluded.ts""",
+                     rating=excluded.rating,sid=excluded.sid,genres=excluded.genres,
+                     kind=excluded.kind,orig=excluded.orig,miss=excluded.miss,ts=excluded.ts""",
                 (tkey, q, e["cover"], e["title"], e["year"], e["rating"],
-                 e["miss"], now))
+                 e["sid"], e["genres"], e["kind"], e["orig"], e["miss"], now))
     except Exception:
         pass
 
@@ -3024,6 +3078,13 @@ async def poster_fallback(request: Request):
                         "cover": cached.get("cover", ""),
                         "year": cached.get("year", ""),
                         "rating": cached.get("rating", ""),
+                        # 作品锚：同豆瓣 sid 即同一作品，前端据此确定性归并中英/原名卡，
+                        # genres/kind 支撑分类真过滤，orig 为原名，title 为规范中文名。
+                        "id": cached.get("sid", ""),
+                        "title": cached.get("title", ""),
+                        "genres": cached.get("genres", ""),
+                        "kind": cached.get("kind", ""),
+                        "orig": cached.get("orig", ""),
                     }
     return {"covers": covers, "meta": meta}
 

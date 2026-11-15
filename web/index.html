@@ -865,7 +865,7 @@ var QUICK_ENTRIES=[
 ];
 
 /* ================= 状态 ================= */
-var state={byType:{},total:0,currentType:"baidu",view:"grid",currentItem:null,startTime:0,me:null,panelTab:"history",quality:"all",grouped:false,watchFilter:"all"};
+var state={byType:{},total:0,currentType:"baidu",view:"grid",currentItem:null,startTime:0,me:null,panelTab:"history",quality:"all",grouped:false,watchFilter:"all",genreFilter:null};
 var favMap={};   // url -> 收藏记录 {id,note,drive,url,password,source}
 
 /* ================= API ================= */
@@ -989,6 +989,7 @@ function fbFlush(){
     .then(function(res){
       var covers=(res&&res.covers)||{};
       var metas=(res&&res.meta)||{};
+      var anchorChanged=false;   /* 本批是否新到豆瓣 sid 作品锚（到达后需按 sid 重新归并分组） */
       /* 同组共享：磁力等脏标题后端没查到时，复用本批同 groupKey 已命中的封面/meta，零额外请求 */
       var gCover={},gMeta={};
       batch.forEach(function(t){
@@ -1005,7 +1006,10 @@ function fbFlush(){
         fbMap[t]=c;
         var mt=metas[t];
         if((!mt||(!mt.rating&&!mt.year))&&gk&&gMeta[gk])mt=gMeta[gk];
-        if(mt)metaMap[t]=mt;
+        if(mt){
+          if(mt.id&&(!metaMap[t]||metaMap[t].id!==mt.id))anchorChanged=true;
+          metaMap[t]=mt;
+        }
         var boxes=fbQueue[t]||[];
         for(var i=0;i<boxes.length;i++){
           if(c)fbApply(boxes[i],c);
@@ -1017,6 +1021,9 @@ function fbFlush(){
         delete fbQueue[t];
       });
       applyMetaNotes();
+      /* 新到豆瓣 sid 锚：分组键可能从清洗名收敛为 db#sid，防抖重渲一次完成中英/原名归并。
+         fbMap 已缓存本批 note，重渲只命中缓存不会再发 poster-fallback 请求，无循环。 */
+      if(anchorChanged)scheduleRegroup();
       done();
     },function(){
       /* 接口异常：丢弃本轮批次，避免堆积阻塞；后续新卡片仍会重新入队 */
@@ -1049,6 +1056,8 @@ function parseYear(note){
 }
 function fillMetaLine(el,note){
   if(!el)return;
+  /* T3：合集/打包横跨多部作品，不套用任何单一部作的年份/评分，meta 行留空（封面仍照常补全） */
+  if(noteIsCollection(note)){el.textContent="";el.style.display="none";return;}
   var mm=metaMap[note]||{};
   var year=(mm.year?String(mm.year):"")||parseYear(note);
   var rating=mm.rating||"";
@@ -1063,6 +1072,21 @@ function fillMetaLine(el,note){
 function applyMetaNotes(){
   var els=document.querySelectorAll("[data-meta-note]");
   for(var i=0;i<els.length;i++){fillMetaLine(els[i],els[i].dataset.metaNote);}
+}
+/* sid 作品锚异步到达后防抖重渲一次：让中英/原名卡按 db#sid 重新归并、genre 过滤复跑。
+   仅在结果区可见且分组模式下进行；重渲不重置当前网盘/画质筛选与滚动锚点。 */
+var _regroupQueued=false;
+function scheduleRegroup(){
+  if(_regroupQueued)return;
+  _regroupQueued=true;
+  setTimeout(function(){
+    _regroupQueued=false;
+    var rs=document.getElementById("resultSection");
+    if(rs&&!rs.classList.contains("hidden")&&state.grouped
+       &&(state.byType[state.currentType]||[]).length){
+      renderResults();
+    }
+  },80);
 }
 
 /* ================= 登录态 / 长效令牌（服务端数据，跨设备） ================= */
@@ -1216,7 +1240,7 @@ function doLogin(){
 document.getElementById("loginForm").addEventListener("submit",function(e){e.preventDefault();doLogin();});
 function resetResults(){
   state.byType={};state.total=0;state.currentType="baidu";state.currentItem=null;
-  state.quality="all";state.grouped=false;
+  state.quality="all";state.grouped=false;state.genreFilter=null;
   document.getElementById("results").innerHTML="";
   document.getElementById("tabs").innerHTML="";
   var fb=document.getElementById("filterBar");fb.innerHTML="";fb.style.display="none";
@@ -1336,6 +1360,8 @@ function doSearch(){
   _searching=true;
   /* 新搜索重置画质筛选为「全部」，避免上一次的画质/网盘选择被带进新搜索导致空结果 */
   state.quality="all";
+  /* T5：类型入口（电影/剧集/动漫/纪录片）按搜索词映射 genre 真过滤；普通词为 null 不过滤 */
+  state.genreFilter=genreRuleOf(kw);
   var btn=document.getElementById("searchBtn"),icon=document.getElementById("searchIcon");
   btn.disabled=true;
   icon.innerHTML='<circle cx="12" cy="12" r="9" stroke-dasharray="40" stroke-linecap="round" class="spin" style="transform-origin:center"/>';
@@ -1421,7 +1447,7 @@ function renderTabs(){
   availableTypes().forEach(function(t){
     var b=document.createElement("button");
     b.className="tab"+(t===state.currentType?" active":"");
-    b.innerHTML=driveShort(t)+'<span class="num">'+state.byType[t].length+'</span>';
+    b.innerHTML=driveShort(t)+'<span class="num">'+genreRowsOf(state.byType[t]||[]).length+'</span>';
     b.addEventListener("click",function(){selectType(t);});
     tabs.appendChild(b);
   });
@@ -1482,6 +1508,24 @@ var _GRP_ISOLATE=/小说|电子书|txt|全文|全本|漫画|有声|解说|短剧
 /* 跨季合集标志：两季/全N季/数字范围（1-2季、1-2）/合集/系列等不参与单季锚定，
    避免把合集并入某一季（此时「第N季」已被 _normSeason 转走，残留数字+季即合集） */
 var _GRP_MULTI=/两季|全\s*\d+\s*季|\d+\s*季|\d+\s*[-~到]\s*\d+|合集|全系列|系列/;
+/* T2：剥离开头的发布组/站点/字幕组品牌与榜单编号等噪声（只影响聚合键，原 note 展示不动）。
+   仅处理"前导"且带强特征的段，不维护大词表、不剥尾部 release 英文 tag，避免误伤片名；
+   不剥《》（常裹片名）。纯数字编号限 1-3 位且分隔符后不紧跟数字，护住四位年份与 8.5 评分。 */
+function _stripBrandPrefix(s){
+  if(!s)return s;
+  for(var k=0;k<4;k++){
+    var prev=s;
+    s=s.replace(/^\s*[【\[（(〔][^】\]）)〕]*[】\]）)〕]\s*/,"");                 /* 开头括号标签块 */
+    s=s.replace(/^[^一-龥0-9a-z《]+/i,"");                                    /* 开头 emoji/符号 */
+    s=s.replace(/^\s*(?:资源名称|文件名称|文件名|名称|资源名|标题|分享文件|短剧名称)\s*[:：]\s*/,"");
+    s=s.replace(/^\s*(?:top|no)\.?\s*0*\d{1,3}(?:\s*[.、_：:](?!\d))?\s*/i,"");/* Top8. / No.008 */
+    s=s.replace(/^\s*0*\d{1,3}\s*[.、_](?!\d)\s*/,"");                        /* 042. / 57. 等编号 */
+    s=s.replace(/^\s*[一-龥a-z0-9]{2,16}(?:字幕组|压制组|压制|发布组|资源站|放映室|工作室|工坊|公社|电影网|影视|影音|小组)[a-z0-9.\-]*\s*[.：:_\-|/～~]?\s*/,"");
+    s=s.trim();
+    if(s===prev)break;
+  }
+  return s;
+}
 /* 作品归一键：按「作品名＋季」成组。统一剥离季号写法差异（第二季/第2季/S02/片尾裸数字）、
    发行年份、集数描述、画质音效编码词、标点与空白；只做清洗后核心名完全相等的确定性折叠，
    不做模糊匹配。无季号的首季保持不带 s，避免与续季误并。 */
@@ -1489,6 +1533,8 @@ function groupKeyOf(note){
   var s=(note||"").toLowerCase();
   /* 0. 剥链接/域名残留（含被白名单粘连前的原始 URL 与 pan.xxx 域名片段） */
   s=s.replace(/https?:\/\/\S+|[\w.-]+\.(?:com|cn|net|me|app|xyz|top|cc|io|org)\S*/gi," ");
+  /* 0.5 T2：剥开头品牌/字幕组/榜单编号/标签块等前导噪声（聚合键专用，note 展示保持原样） */
+  s=_stripBrandPrefix(s);
   /* 1. 剥发行年份（1950-2039 四位，连带「年」字），年份只是标注、不参与成组 */
   s=s.replace(/(?:19|20)\d{2}\s*年?/g," ");
   /* 评分（8.3 分）与「第N届」奖项/排名，不是季号 */
@@ -1591,12 +1637,46 @@ function buildResultItem(it,view){
   if(lf){lf.classList.toggle("on",!!favMap[it.url]);lf.addEventListener("click",function(e){e.stopPropagation();toggleFav(it,lf);});}
   return row;
 }
+/* T1：取一条资源对应的豆瓣作品锚（含 sid/规范中文名/genre/种类/原名），无 sid 返回 null */
+function workAnchorOf(note){
+  var m=metaMap[note];
+  return m&&m.id?m:null;
+}
+function _hasCJK(s){return /[一-龥]/.test(s||"");}
+/* T3：判定一条资源是否跨季合集/打包（复刻 groupKeyOf 内 multi 时点：剥前缀、去年份、季号归一后测标志） */
+function noteIsCollection(note){
+  var s=(note||"").toLowerCase()
+    .replace(/https?:\/\/\S+|[\w.-]+\.(?:com|cn|net|me|app|xyz|top|cc|io|org)\S*/gi," ");
+  s=_stripBrandPrefix(s);
+  s=s.replace(/(?:19|20)\d{2}\s*年?/g," ");
+  s=_normSeason(s);
+  return _GRP_MULTI.test(s);
+}
+/* T1：组内代表卡优先选含中文、清洗后核心更短（噪声更少）的资源，组头展示更干净 */
+function pickRepNote(items){
+  var rep=items[0],bestLen=Infinity,found=false;
+  for(var i=0;i<items.length;i++){
+    var n=items[i].note||"";
+    if(!_hasCJK(n))continue;
+    var gk=groupKeyOf(n)||"";var len=gk.length||n.length;
+    if(!found||len<bestLen){rep=items[i];bestLen=len;found=true;}
+  }
+  return rep;
+}
 function renderGrouped(container,rows){
   var map={},order=[];
   rows.forEach(function(it){
-    var k=groupKeyOf(it.note);
+    var base=groupKeyOf(it.note);
+    var isolated=_GRP_ISOLATE.test(base);
+    var collection=noteIsCollection(it.note)||isolated;
+    var a=workAnchorOf(it.note);
+    /* 仅当锚到同一豆瓣 sid 且非合集/非衍生内容时才确定性归并；同名不同作 sid 不同天然不并，
+       无锚（miss/风控）回退清洗名折叠，绝不硬并。合集与小说/短剧/花絮等不参与 sid 合并。 */
+    var k=(!collection&&a&&a.id)?("db#"+a.id):base;
     if(!k||k.length<2)k="__u__"+dedupKey(it.url);
-    if(!map[k]){map[k]={items:[]};order.push(k);}
+    if(!map[k]){map[k]={items:[],anchor:null,isCollection:collection};order.push(k);}
+    if(!map[k].anchor&&a&&!collection)map[k].anchor=a;
+    if(collection)map[k].isCollection=true;
     map[k].items.push(it);
   });
   order.forEach(function(k){
@@ -1604,15 +1684,24 @@ function renderGrouped(container,rows){
     if(g.items.length===1){container.appendChild(buildResultItem(g.items[0],state.view));return;}
     var drives={},topTag="",topScore=-1;
     g.items.forEach(function(it){drives[it.drive]=1;if(it.score>topScore){topScore=it.score;topTag=it.tags[0]||"";}});
+    var rep=pickRepNote(g.items);
+    var repNote=rep.note||"";
+    /* 组头标题：有作品锚用豆瓣规范中文名，否则用代表卡原标题；版本列表内逐条仍显示各自原 note */
+    var headTitle=(g.anchor&&g.anchor.title)?g.anchor.title:(repNote||"未命名");
+    /* 年份评分行绑定到组内任一 metaMap 已就绪的 note（同 sid 数据一致）；合集不套单作 meta */
+    var metaNote=repNote;
+    if(!metaMap[metaNote]){
+      for(var i=0;i<g.items.length;i++){if(metaMap[g.items[i].note]){metaNote=g.items[i].note;break;}}
+    }
     var grp=document.createElement("div");grp.className="grp";
     var head=document.createElement("button");head.className="grp-head";
-    var repNote=g.items[0].note||"";
     head.innerHTML='<svg class="grp-caret" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg>'+
-      '<span class="grp-twrap"><span class="grp-title">'+esc(repNote||"未命名")+'</span>'+
-      '<span class="meta-line grp-metaline" data-meta-note="'+esc(repNote)+'"></span></span><span class="grp-meta">'+
+      '<span class="grp-twrap"><span class="grp-title">'+esc(headTitle)+'</span>'+
+      '<span class="meta-line grp-metaline" data-meta-note="'+esc(metaNote)+'"></span></span><span class="grp-meta">'+
       (topTag?'<span class="gm gold">'+esc(topTag)+'</span>':'')+
       '<span class="gm">'+g.items.length+' 个版本</span><span class="gm">'+Object.keys(drives).length+' 个网盘</span></span>';
-    fillMetaLine(head.querySelector(".grp-metaline"),repNote);
+    if(g.isCollection){head.querySelector(".grp-metaline").style.display="none";}
+    else{fillMetaLine(head.querySelector(".grp-metaline"),metaNote);}
     var body=document.createElement("div");body.className="grp-body";
     var inner=document.createElement("div");inner.className=state.view==="grid"?"grid":"list";
     g.items.forEach(function(it){inner.appendChild(buildResultItem(it,state.view));});
@@ -1624,19 +1713,62 @@ function renderGrouped(container,rows){
 }
 
 /* ================= 渲染 ================= */
+/* T5：把类型入口搜索词映射到作品级 genre 规则；普通资源词返回 null（不启用过滤） */
+function genreRuleOf(kw){
+  kw=(kw||"").toLowerCase();
+  if(/纪录片/.test(kw))return "doc";
+  if(/动漫|动画|卡通/.test(kw))return "anime";
+  if(/电视剧|剧集|美剧|韩剧|日剧|港剧|台剧|国剧/.test(kw))return "tv";
+  if(/电影/.test(kw))return "movie";
+  return null;
+}
+/* T5：单条是否符合当前类型。有豆瓣作品锚用 kind/genres 真判定；
+   锚缺失或 genres/kind 空（miss/风控/缓存重建中）回退为标题含类型词，避免误杀真作品。 */
+function keepByGenre(it){
+  var rule=state.genreFilter;
+  if(!rule)return true;
+  var m=metaMap[it.note]||null;
+  var title=(it.note||"").toLowerCase();
+  var hasG=!!(m&&(m.genres||m.kind));
+  if(rule==="doc"){
+    if(hasG)return /纪录/.test(m.genres||"");
+    /* 回退同时识别「纪录片」与刮削文案「类型: 纪录」；混入剧集标注为「剧情」不会命中 */
+    return /纪录/.test(title);
+  }
+  if(rule==="anime"){
+    if(hasG)return /动画/.test(m.genres||"");
+    return /动漫|动画|卡通|anime/.test(title);
+  }
+  if(rule==="tv"){
+    if(hasG)return m.kind==="tv"||/电视剧/.test(m.genres||"");
+    return /电视剧|剧集|美剧|韩剧|日剧|港剧|台剧|国剧|连续剧|\d+\s*集|更\s*\d+|全\s*\d+\s*季/.test(title);
+  }
+  if(rule==="movie"){
+    if(hasG)return m.kind==="movie"&&!/纪录片/.test(m.genres||"");
+    return /电影/.test(title);
+  }
+  return true;
+}
+/* T5：渲染层派生过滤集，不改动 state.byType 原始数据，网盘桶集合与缓存保持完整 */
+function genreRowsOf(rows){
+  if(!state.genreFilter)return rows;
+  return (rows||[]).filter(keepByGenre);
+}
 function renderResults(){
   var box=document.getElementById("results");
   var rawAll=state.byType[state.currentType]||[];
-  var rows=applyQuality(rawAll);
-  /* 筛选时标题显示「筛后 M 条（共 N 条）」，未筛选显示该网盘总数 */
+  var baseRows=genreRowsOf(rawAll);
+  var rows=applyQuality(baseRows);
+  /* 标题计数反映 genre 真过滤 + 画质筛选后的条数；任一过滤生效则附原始总数 */
   var rtEl=document.getElementById("rTotal"),tailEl=document.getElementById("rTotalTail");
-  if(rtEl)rtEl.textContent=state.quality==="all"?rawAll.length:rows.length;
-  if(tailEl)tailEl.textContent=state.quality==="all"?" 条资源":" 条（共 "+rawAll.length+" 条）";
+  var filtered=state.quality!=="all"||baseRows.length<rawAll.length;
+  if(rtEl)rtEl.textContent=filtered?rows.length:baseRows.length;
+  if(tailEl)tailEl.textContent=filtered?" 条（共 "+rawAll.length+" 条）":" 条资源";
   box.innerHTML="";
   if(!rows.length){
     var empty=document.createElement("div");
     empty.className="panel-empty";empty.style.padding="40px 0";
-    empty.innerHTML='<h4>该画质下暂无资源</h4><p>换一个画质筛选，或切到「全部」查看全部 '+((state.byType[state.currentType]||[]).length)+' 条</p>';
+    empty.innerHTML='<h4>该筛选下暂无资源</h4><p>换一个画质/类型筛选，或切到「全部」查看全部 '+rawAll.length+' 条</p>';
     box.appendChild(empty);renderFilterBar();return;
   }
   var container=document.createElement("div");
@@ -2011,12 +2143,37 @@ function countsTextFromServer(s){
     return parts.join(" · ");
   }catch(e){return "";}
 }
+/* T4：本人 MCP 长效令牌卡片。令牌即登录 JWT（localStorage 同源），仅本会话本人可见，
+   不新增接口、不改登录与有效期；用户主动点击才读取并写入只读框，默认不渲染令牌内容。 */
+function mcpCard(){
+  return '<div class="mcp-card" style="border:1px solid var(--line-strong);background:rgba(255,255,255,.02);border-radius:12px;padding:14px;margin:10px 2px">'+
+    '<div style="font-weight:600;margin-bottom:4px">MCP 接入令牌</div>'+
+    '<div style="font-size:12.5px;color:var(--text-2);line-height:1.6;margin-bottom:10px">点一下即可生成并复制你本人的长效令牌，用于在其他 Agent 或 MCP 客户端接入本站，无需再提供账号密码。令牌与当前登录态同源，有效期规则不变。</div>'+
+    '<button class="um-btn" data-act="mcpgen" style="min-height:40px">生成并复制我的 MCP 令牌</button>'+
+    '<div id="mcpTokWrap" style="display:none;margin-top:10px">'+
+      '<textarea id="mcpTok" class="um-input" readonly rows="3" style="width:100%;resize:vertical;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px;word-break:break-all"></textarea>'+
+      '<button class="text-btn" data-act="mcpcopy" style="margin-top:6px">重新复制</button>'+
+    '</div>'+
+    '<div style="font-size:12px;color:var(--text-2);line-height:1.6;margin-top:8px">令牌等同账号钥匙/密码，可直接调用 MCP 接口，请勿外传或截图分享。</div>'+
+  '</div>';
+}
+function genMcpToken(){
+  var tok=localStorage.getItem(TOKEN_KEY);
+  if(!tok){toast("warn","未检测到登录态，请重新登录后再生成");return;}
+  copyText(tok,"MCP 令牌已复制到剪贴板");
+  var wrap=document.getElementById("mcpTokWrap"),ta=document.getElementById("mcpTok");
+  if(wrap&&ta){ta.value=tok;wrap.style.display="";}
+}
+function copyMcpAgain(){
+  var ta=document.getElementById("mcpTok");
+  if(ta&&ta.value)copyText(ta.value,"MCP 令牌已重新复制");
+}
 function renderHistory(){
   panelBody.innerHTML='<div class="panel-empty"><h4>加载中…</h4></div>';
   loadHistory().then(function(){
     var items=histItems;
-    if(!items.length){panelBody.innerHTML=cpwBar()+panelEmpty("还没有搜索历史","搜过的片子自动同步到云端，换设备登录也在");return;}
-    var html=cpwBar()+'<div class="panel-toolbar"><button class="text-btn" id="clearHistBtn">清空全部</button></div>';
+    if(!items.length){panelBody.innerHTML=cpwBar()+mcpCard()+panelEmpty("还没有搜索历史","搜过的片子自动同步到云端，换设备登录也在");return;}
+    var html=cpwBar()+mcpCard()+'<div class="panel-toolbar"><button class="text-btn" id="clearHistBtn">清空全部</button></div>';
     items.forEach(function(h){
       var kw=h.keyword,total=h.last_total||0,ts=h.last_ts;
       var hc=countsTextFromServer(h.last_counts);
@@ -2480,6 +2637,8 @@ panelBody.addEventListener("click",function(e){
   else if(act==="cpw"){openCpw();}
   else if(act==="cpwconfirm"){submitCpw();}
   else if(act==="cpwcancel"){closeCpw();}
+  else if(act==="mcpgen"){genMcpToken();}
+  else if(act==="mcpcopy"){copyMcpAgain();}
   else if(act==="uadd"){addUser();}
   else if(act==="ureset"){showResetRow(t.dataset.id);}
   else if(act==="uconfirmreset"){confirmReset(t.dataset.id);}
